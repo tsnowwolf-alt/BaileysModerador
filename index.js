@@ -192,10 +192,6 @@ const persistProtegidos = criarMapaPersistente('numeros-protegidos.json'); // nu
 // lista ainda estiver vazia — depois disso é 100% editável pelo /contatos, essa linha não repete.
 async function garantirProtegidosDoDono() {
   await persistProtegidos.carregar();
-  // O número de telefone e o @lid são identificadores DIFERENTES pro Baileys — e como a v6.x não
-  // tem a API pra resolver um a partir do outro (mesma limitação de @lid documentada desde o
-  // início do projeto), proteger só o número não bastava: as mensagens do grupo chegam com
-  // participant = @lid, não o número. Protege os dois formatos, sem depender de resolução nenhuma.
   const identificadoresDono = ['5511986694787@s.whatsapp.net', '157728429347047@lid'];
   let mudou = false;
   for (const id of identificadoresDono) {
@@ -211,12 +207,9 @@ async function garantirProtegidosDoDono() {
 }
 
 // IDs de mensagem já processadas, pra nunca reagir duas vezes à mesma mensagem.
-// NÃO persiste: só protege contra reentrega quase-simultânea dentro da MESMA conexão ativa.
-// Depois de um restart é uma sessão nova — o cache começar vazio de novo não é problema.
 const processedMessageIds = new Set();
 
 // Timestamps recentes por pessoa, pra IA saber se ela está mandando mensagem em rajada.
-// NÃO persiste: a janela é de só 60s, então histórico de antes de um restart já não conta mais.
 const recentMessageTimestamps = new Map();
 
 function contarMensagensRecentes(chave) {
@@ -227,9 +220,7 @@ function contarMensagensRecentes(chave) {
   return lista.length;
 }
 
-// Helper genérico pra persistir um Map em disco, dentro do AUTH_FOLDER (a mesma pasta que já
-// sobrevive a redeploy por causa da sessão do Baileys — nenhum Volume novo precisa ser configurado).
-// Carrega uma vez no boot, salva com debounce a cada atualização, e permite forçar um flush no shutdown.
+// Helper genérico pra persistir um Map em disco, dentro do AUTH_FOLDER.
 function criarMapaPersistente(nomeArquivo, { debounceMs = 2000 } = {}) {
   const mapa = new Map();
   const arquivo = path.join(AUTH_FOLDER, nomeArquivo);
@@ -237,7 +228,7 @@ function criarMapaPersistente(nomeArquivo, { debounceMs = 2000 } = {}) {
   let timer = null;
 
   async function carregar() {
-    if (carregado) return; // só carrega uma vez por execução (evita pisar em dado novo num reconnect)
+    if (carregado) return;
     carregado = true;
     try {
       const bruto = await readFile(arquivo, 'utf-8');
@@ -263,11 +254,11 @@ function criarMapaPersistente(nomeArquivo, { debounceMs = 2000 } = {}) {
   }
 
   function agendarSalvar() {
-    if (timer) return; // já tem um save agendado — as próximas chamadas pegam carona nele
+    if (timer) return;
     timer = setTimeout(() => {
       timer = null;
       salvarAgora();
-    }, debounceMs); // agrupa rajadas de atualização num salvamento só, em vez de escrever a cada evento
+    }, debounceMs);
   }
 
   function flush() {
@@ -279,9 +270,7 @@ function criarMapaPersistente(nomeArquivo, { debounceMs = 2000 } = {}) {
   return { mapa, carregar, agendarSalvar, flush };
 }
 
-// Variante do helper acima pra um único objeto (não uma coleção por chave) — usado pra
-// configuração ajustável e pro estado atual do ciclo de enquete/debate. Mesmo mecanismo:
-// carrega uma vez, salva com debounce, dá pra forçar flush no shutdown.
+// Variante do helper acima pra um único objeto (não uma coleção por chave).
 function criarValorPersistente(nomeArquivo, valorPadrao, { debounceMs = 2000 } = {}) {
   let valor = { ...valorPadrao };
   const arquivo = path.join(AUTH_FOLDER, nomeArquivo);
@@ -293,7 +282,7 @@ function criarValorPersistente(nomeArquivo, valorPadrao, { debounceMs = 2000 } =
     carregado = true;
     try {
       const bruto = await readFile(arquivo, 'utf-8');
-      valor = { ...valorPadrao, ...JSON.parse(bruto) }; // o padrão preenche campos novos que um arquivo antigo ainda não tem
+      valor = { ...valorPadrao, ...JSON.parse(bruto) };
       console.log(`${nomeArquivo}: carregado do disco.`);
     } catch (err) {
       if (err.code === 'ENOENT') {
@@ -340,40 +329,29 @@ function criarValorPersistente(nomeArquivo, valorPadrao, { debounceMs = 2000 } =
 }
 
 // Contagem de violações (chave: "grupo_id:participant" -> número de violações).
-// Zera quando a pessoa é removida. Persistida em disco — não zera mais sozinha num restart.
 const persistViolacoes = criarMapaPersistente('violations.json');
 const violationCounts = persistViolacoes.mapa;
 
-// Pessoas vistas mandando mensagem em algum grupo — alimenta a página /contatos,
-// pra achar o identificador de alguém pelo nome sem precisar caçar no log. Também persistida.
+// Pessoas vistas mandando mensagem em algum grupo — alimenta a página /contatos.
 const persistContatos = criarMapaPersistente('contatos.json');
-const contatosVistos = persistContatos.mapa; // chave: participant (lid ou jid) -> { nome, grupoId, numero, ultimaVez }
+const contatosVistos = persistContatos.mapa;
 
 function registrarContatoVisto(participant, nome, grupoId, numero) {
   contatosVistos.set(participant, { nome, grupoId, numero, ultimaVez: new Date().toISOString() });
   persistContatos.agendarSalvar();
 }
 
-// --- Enquete/debate: configuração, tópicos, estado do ciclo e mensagens enviadas (pra voto de enquete) ---
-
-// Ajustável pelo /painel. minVotosDebate: 6 = "mais de 5 pessoas votaram" tem que ser >= 6.
-// O ciclo (enquete + debate) roda TODO DIA no horário configurado — intervaloDiasMencao controla
-// só a menção geral (@todos), que é mais espaçada pra não virar spam de notificação.
+// --- Enquete/debate: configuração, tópicos, estado do ciclo e mensagens enviadas ---
 const configDebate = criarValorPersistente('config-debate.json', {
   grupoId: '',
-  horario: '20:00', // HH:mm, fuso America/Sao_Paulo — usado sábado e domingo
-  horarioSemana: '20:00', // HH:mm — usado de segunda a sexta (detectado automaticamente)
-  intervaloDiasMencao: 7, // a cada quantos dias a menção geral entra no anúncio
+  horario: '20:00',
+  horarioSemana: '20:00',
+  intervaloDiasMencao: 7,
   duracaoEnqueteHoras: 1,
   duracaoDebateHoras: 1,
   minVotosDebate: 6
 });
 
-// fase: 'normal' | 'enquete' | 'debate'. votosAcumulados guarda os votos brutos (não decriptados)
-// recebidos — a decriptação em si é manual (decryptPollVote), tentada de novo a cada resolução,
-// por isso precisa do histórico completo, inclusive depois de um restart no meio da enquete.
-// ultimoCicloIniciadoEm é só informativo (mostrado no /painel); ultimaMencaoEm é o que
-// realmente controla o intervaloDiasMencao acima.
 const estadoDebate = criarValorPersistente('estado-debate.json', {
   fase: 'normal',
   grupoId: null,
@@ -382,15 +360,13 @@ const estadoDebate = criarValorPersistente('estado-debate.json', {
   terminaEm: null,
   pollMessageKey: null,
   votosAcumulados: [],
-  votantesConhecidos: [], // quem mandou um voto (msg.key.participant, sem decriptar) — ver nota em resolverEnquete
+  votantesConhecidos: [],
   ultimoCicloIniciadoEm: null,
   ultimaMencaoEm: null,
   topicoId: null,
-  proximoDisparoEm: null // calculado uma vez (não a cada minuto) — ver calcularProximoDisparo/atualizarProximoDisparo
+  proximoDisparoEm: null
 });
 
-// Recalcula e guarda o próximo disparo — chamado só quando algo que afeta o cálculo muda
-// (config salva, fase volta pro normal), não a cada tick do verificarCicloDebate.
 function atualizarProximoDisparo() {
   const cfg = configDebate.get();
   if (!cfg.grupoId) {
@@ -401,12 +377,9 @@ function atualizarProximoDisparo() {
   estadoDebate.set({ proximoDisparoEm: proximo ? proximo.toISOString() : null });
 }
 
-// Lista de tópicos de enquete cadastrados (adicionados pelo /painel). Nunca gerados pela IA —
-// só consultados dali. Guardado como Map (preserva ordem de inserção) mesmo sendo uma "lista".
 const persistTopicos = criarMapaPersistente('topicos-enquete.json');
-const topicosEnquete = persistTopicos.mapa; // chave: id -> { tema, opcoes: [...], usado, criadoEm }
+const topicosEnquete = persistTopicos.mapa;
 
-// Pega o primeiro tópico ainda não usado (ordem de cadastro) e marca como usado.
 function escolherProximoTopico() {
   for (const [id, topico] of topicosEnquete) {
     if (!topico.usado) {
@@ -418,17 +391,56 @@ function escolherProximoTopico() {
   return null;
 }
 
-// Guarda só as mensagens que o próprio bot manda e que podem precisar ser reconsultadas depois —
-// hoje, só a mensagem de criação de cada enquete (é o que getMessage/decriptação de voto exige).
 const persistMensagensEnviadas = criarMapaPersistente('mensagens-enviadas.json');
+
+// Garante que chaves e payloads lidos do arquivo JSON voltem a ser Buffer de verdade
+function garantirBuffer(val) {
+  if (!val) return val;
+  if (Buffer.isBuffer(val) || val instanceof Uint8Array) return Buffer.from(val);
+  if (val.type === 'Buffer' && Array.isArray(val.data)) return Buffer.from(val.data);
+  if (val.data && Array.isArray(val.data)) return Buffer.from(val.data);
+  return val;
+}
 
 async function getMessage(key) {
   const registro = persistMensagensEnviadas.mapa.get(`${key.remoteJid}:${key.id}`);
-  return registro || undefined;
+  if (!registro) return undefined;
+  // Garante que o messageSecret volte como Buffer real para o Baileys não descartar atualizações de enquete após restart
+  if (registro.messageContextInfo?.messageSecret) {
+    registro.messageContextInfo.messageSecret = garantirBuffer(registro.messageContextInfo.messageSecret);
+  }
+  return registro;
 }
 
-// Railway manda SIGTERM pra reiniciar/redeploy (o "Stopping Container" que vocês já veem nos logs) —
-// aqui a gente garante que o último estado de cada Map/valor persistente é gravado antes do processo morrer.
+// Acumula ou atualiza um voto de forma segura, evitando duplicatas e mantendo a escolha mais recente do eleitor
+function acumularVotoSeguro(votoEntry, votanteJid) {
+  if (!votanteJid) return;
+  const estadoAgora = estadoDebate.get();
+  const conjuntoVotantes = new Set(estadoAgora.votantesConhecidos);
+  conjuntoVotantes.add(votanteJid);
+
+  // Remove voto anterior da mesma pessoa (se houver) para manter apenas a última escolha
+  const outrosVotos = (estadoAgora.votosAcumulados || []).filter((v) => {
+    const jidExistente = v.voterJid || v.pollUpdateMessageKey?.participant || v.key?.participant || v.pollUpdateMessageKey?.remoteJid;
+    return jidExistente !== votanteJid;
+  });
+
+  const votoNormalizado = {
+    ...votoEntry,
+    voterJid: votanteJid,
+    vote: {
+      ...votoEntry.vote,
+      encPayload: garantirBuffer(votoEntry.vote?.encPayload),
+      encIv: garantirBuffer(votoEntry.vote?.encIv)
+    }
+  };
+
+  estadoDebate.set({
+    votosAcumulados: [...outrosVotos, votoNormalizado],
+    votantesConhecidos: [...conjuntoVotantes]
+  });
+}
+
 for (const sinal of ['SIGTERM', 'SIGINT']) {
   process.on(sinal, async () => {
     console.log(`Sinal ${sinal} recebido — salvando dados antes de encerrar...`);
@@ -448,14 +460,14 @@ for (const sinal of ['SIGTERM', 'SIGINT']) {
 }
 
 let sock;
-let currentQR = null;   // string do QR pendente de leitura (null = não há QR ativo agora)
+let currentQR = null;
 let isConnected = false;
-let tickerDebateIniciado = false; // evita empilhar vários setInterval em reconexões
+let tickerDebateIniciado = false;
 
 async function enviarComDigitando(jid, texto, mentions = []) {
   try {
     await sock.sendPresenceUpdate('composing', jid);
-    await new Promise((resolve) => setTimeout(resolve, 1200 + Math.random() * 1300)); // ~1.2-2.5s, rápido mas com efeito de digitação
+    await new Promise((resolve) => setTimeout(resolve, 1200 + Math.random() * 1300));
     const mensagemEnviada = await sock.sendMessage(jid, mentions.length > 0 ? { text: texto, mentions } : { text: texto });
     await sock.sendPresenceUpdate('paused', jid);
     return mensagemEnviada;
@@ -464,8 +476,6 @@ async function enviarComDigitando(jid, texto, mentions = []) {
     throw err;
   }
 }
-
-// --- Ciclo de enquete/debate: tudo aqui é lógica determinística, nada passa pela IA ---
 
 async function iniciarCicloDebate() {
   const cfg = configDebate.get();
@@ -492,10 +502,6 @@ async function iniciarCicloDebate() {
       jidsParaMencionar = metadata.participants.map((p) => p.id);
     }
 
-    // "Menção fantasma" (só o array mentions, sem @numero escrito no texto) tem bug conhecido
-    // no Baileys: funciona no Android/Web mas não no iOS, e nem a documentação oficial usa
-    // esse padrão — o exemplo deles sempre escreve o @numero junto do array. Por isso o texto
-    // ganha uma linha com @cada-participante quando é dia de menção geral; sem isso, some.
     const blocoMencoes = jidsParaMencionar.length > 0
       ? `\n\n${jidsParaMencionar.map((jid) => `@${jid.split('@')[0]}`).join(' ')}`
       : '';
@@ -513,12 +519,12 @@ async function iniciarCicloDebate() {
     persistMensagensEnviadas.agendarSalvar();
 
     try {
-      await sock.groupSettingUpdate(cfg.grupoId, 'announcement'); // só admin manda mensagem enquanto a enquete está aberta
+      await sock.groupSettingUpdate(cfg.grupoId, 'announcement');
     } catch (err) {
-      console.error('Erro ao ativar modo só-admin (a enquete já foi criada mesmo assim, seguindo em frente):', err.message);
+      console.error('Erro ao ativar modo só-admin:', err.message);
     }
     try {
-      await sock.groupJoinApprovalMode(cfg.grupoId, 'on'); // aprovação de entrada já liga com a enquete, não só no debate
+      await sock.groupJoinApprovalMode(cfg.grupoId, 'on');
     } catch (err) {
       console.error('Erro ao ligar aprovação de entrada no início da enquete:', err.message);
     }
@@ -540,36 +546,19 @@ async function iniciarCicloDebate() {
 
     console.log(`Ciclo de debate iniciado: "${topico.tema}" em ${cfg.grupoId} (${deveMencionar ? 'com' : 'sem'} menção geral)`);
   } catch (err) {
-    console.error('Erro ao iniciar ciclo de debate (o bot é admin do grupo configurado?):', err.message);
+    console.error('Erro ao iniciar ciclo de debate:', err.message);
   }
 }
 
-// Garante que chaves e payloads lidos do arquivo JSON voltem a ser Buffer de verdade
-function garantirBuffer(val) {
-  if (!val) return val;
-  if (Buffer.isBuffer(val) || val instanceof Uint8Array) return Buffer.from(val);
-  if (val.type === 'Buffer' && Array.isArray(val.data)) return Buffer.from(val.data);
-  if (val.data && Array.isArray(val.data)) return Buffer.from(val.data);
-  return val;
-}
-
-// getAggregateVotesInPollMessage (a função pronta do Baileys) devolve voters:[] vazio nesse
-// ambiente — confirmado por log. A causa documentada: em grupos com @lid, a decriptação de voto
-// exige o JID de quem CRIOU a enquete no formato @lid (não @s.whatsapp.net) — e a função pronta
-// do Baileys não tenta essa combinação sozinha. Aqui a gente decripta na mão, chamando
-// decryptPollVote diretamente e testando as combinações de formato de JID, começando pela que
-// é documentada como a que resolve na prática.
 function descobrirOpcaoDoVoto(votoEntry, ctx) {
   const { pollEncKey, pollMsgId, opcoesHash, botLidNormalizado, botPn } = ctx;
   const candidatosCriador = [botLidNormalizado, botPn].filter(Boolean);
 
-  // 1. Encontra o JID de quem votou (cobre tanto messages.upsert quanto messages.update)
   const voterJid = votoEntry.voterJid 
     || votoEntry.pollUpdateMessageKey?.participant 
     || votoEntry.key?.participant 
     || votoEntry.pollUpdateMessageKey?.remoteJid;
 
-  // 2. Restaura os buffers criptografados caso tenham vindo do JSON após reinício
   const voteSeguro = {
     ...votoEntry.vote,
     encPayload: garantirBuffer(votoEntry.vote?.encPayload),
@@ -589,25 +578,23 @@ function descobrirOpcaoDoVoto(votoEntry, ctx) {
       for (const [opcaoTexto, hashOpcao] of opcoesHash) {
         if (hashesEscolhidos.includes(hashOpcao)) return { opcao: opcaoTexto, decriptou: true };
       }
-      return { opcao: null, decriptou: true }; // decriptou mas o hash não bateu com nenhuma opção conhecida
+      return { opcao: null, decriptou: true };
     } catch {
       // tenta o próximo formato de JID
     }
   }
-  return { opcao: null, decriptou: false }; // nenhuma combinação conseguiu decriptar
+  return { opcao: null, decriptou: false };
 }
 
 async function resolverEnquete() {
   const estado = estadoDebate.get();
   const cfg = configDebate.get();
   let debateComeca = false;
-  // CORREÇÃO: se não der pra apurar, usa a primeira opção da enquete como fallback (nunca a pergunta!)
+  // Se não der pra apurar, usa a primeira opção da enquete como fallback (nunca o título!)
   let temaVencedor = estado.opcoes[0] || 'Tema geral';
 
   try {
     const mensagemCriacao = await getMessage(estado.pollMessageKey);
-    // totalVotantes vem de quem mandou msg.key.participant (sem decriptar nada) — é o dado
-    // confiável, não depende de nenhuma decriptação e não pode falhar do mesmo jeito.
     const totalVotantes = new Set(estado.votantesConhecidos).size;
     console.log(`DIAGNÓSTICO ENQUETE: votantesConhecidos=${totalVotantes}, votosAcumulados.length=${estado.votosAcumulados.length}, mensagemCriacao encontrada=${!!mensagemCriacao}`);
 
@@ -634,14 +621,14 @@ async function resolverEnquete() {
           temaVencedor = opcaoVencedora;
         }
       } catch (errDecrypt) {
-        console.error('DIAGNÓSTICO ENQUETE: erro tentando decriptar votos (sem problema, totalVotantes não depende disso) —', errDecrypt.message);
+        console.error('DIAGNÓSTICO ENQUETE: erro tentando decriptar votos —', errDecrypt.message);
       }
     } else if (!pollEncKey) {
-      console.error('DIAGNÓSTICO ENQUETE: mensagemCriacao não tem messageContextInfo.messageSecret — sem essa chave não dá pra decriptar voto nenhum.');
+      console.error('DIAGNÓSTICO ENQUETE: mensagemCriacao não tem messageContextInfo.messageSecret.');
     }
 
     try {
-      await sock.groupSettingUpdate(estado.grupoId, 'not_announcement'); // libera mensagem geral de novo, com ou sem debate
+      await sock.groupSettingUpdate(estado.grupoId, 'not_announcement');
     } catch (err) {
       console.error('Erro ao liberar mensagens do grupo:', err.message);
     }
@@ -671,17 +658,12 @@ async function resolverEnquete() {
       }
       if (mensagemAnuncio) {
         try {
-          // Fixa por 24h (o único valor documentado — "type: 1, time: 86400"). Aviso: há relato
-          // aberto no repositório oficial do Baileys de essa chamada às vezes não fazer nada
-          // (issue #543) — por isso o log explícito, pra confirmar se funcionou de verdade ou não.
           await sock.sendMessage(estado.grupoId, { pin: { type: 1, time: 86400, key: mensagemAnuncio.key } });
-          console.log('Mensagem de início do debate fixada (ou pelo menos a chamada não deu erro).');
+          console.log('Mensagem de início do debate fixada.');
         } catch (err) {
-          console.error('Erro ao fixar mensagem do debate (recurso com relato de instabilidade no Baileys):', err.message);
+          console.error('Erro ao fixar mensagem do debate:', err.message);
         }
       }
-      // Aprovação de entrada já está ligada desde o início da enquete — nada a fazer aqui, só
-      // continua até encerrarDebate() desligar.
     } else {
       try {
         await enviarComDigitando(estado.grupoId, `📉 Só ${totalVotantes} voto(s) na enquete sobre *${estado.tema}* — não vai ter debate hoje.`);
@@ -689,16 +671,14 @@ async function resolverEnquete() {
         console.error('Erro ao anunciar que não vai ter debate:', err.message);
       }
       try {
-        await sock.groupJoinApprovalMode(estado.grupoId, 'off'); // sem debate, encerra o período protegido que começou junto com a enquete
+        await sock.groupJoinApprovalMode(estado.grupoId, 'off');
       } catch (err) {
-        console.error('Erro ao desligar aprovação de entrada (sem debate hoje):', err.message);
+        console.error('Erro ao desligar aprovação de entrada:', err.message);
       }
     }
   } catch (err) {
     console.error('Erro ao resolver enquete:', err.message);
   } finally {
-    // O estado sempre avança daqui, mesmo que alguma chamada acima tenha falhado — senão o ciclo
-    // fica preso relendo a mesma enquete (e reenviando a mesma mensagem) a cada minuto pra sempre.
     if (debateComeca) {
       estadoDebate.set({
         fase: 'debate',
@@ -728,9 +708,6 @@ async function encerrarDebate() {
   }
 }
 
-// Roda a cada minuto (ver setInterval mais abaixo). Decide se é hora de: iniciar um ciclo novo,
-// fechar a enquete e decidir se vira debate, ou encerrar um debate em andamento. Nada disso
-// chama a IA — é só relógio + Baileys.
 let processandoCicloDebate = false;
 async function verificarCicloDebate() {
   if (!sock || !isConnected || processandoCicloDebate) return;
@@ -741,9 +718,9 @@ async function verificarCicloDebate() {
     const agora = new Date();
 
     if (estado.fase === 'normal') {
-      if (!cfg.grupoId) return; // ninguém configurou um grupo no /painel ainda
+      if (!cfg.grupoId) return;
       if (!estado.proximoDisparoEm) {
-        atualizarProximoDisparo(); // primeira vez vendo um grupo configurado (ou versão antiga sem esse campo) — calcula uma vez
+        atualizarProximoDisparo();
         return;
       }
       if (agora >= new Date(estado.proximoDisparoEm)) {
@@ -765,8 +742,6 @@ async function verificarCicloDebate() {
   }
 }
 
-// Arquivos que são NOSSOS (não do Baileys) e moram dentro do AUTH_FOLDER — nunca apagar esses
-// quando limpar a sessão velha, senão perde contatos/violações/tópicos/config junto com o logout.
 const ARQUIVOS_PROPRIOS_NO_AUTH_FOLDER = new Set([
   'contatos.json', 'violations.json', 'config-debate.json', 'estado-debate.json',
   'topicos-enquete.json', 'mensagens-enviadas.json', 'numeros-banidos.json', 'numeros-liberados.json'
@@ -797,7 +772,7 @@ async function connectToWhatsApp() {
     garantirProtegidosDoDono()
   ]);
   if (estadoDebate.get().fase === 'normal' && !estadoDebate.get().proximoDisparoEm) {
-    atualizarProximoDisparo(); // só na primeira vez — reconectar depois não deve reagendar
+    atualizarProximoDisparo();
   }
   const { version, isLatest } = await fetchLatestBaileysVersion();
   console.log(`Usando WhatsApp Web v${version.join('.')} (mais recente conhecida: ${isLatest})`);
@@ -828,7 +803,7 @@ async function connectToWhatsApp() {
       const shouldReconnect = statusCode !== DisconnectReason.loggedOut;
       console.log('Conexão fechada:', lastDisconnect?.error?.message, '| Reconectando:', shouldReconnect);
       if (shouldReconnect) {
-        setTimeout(connectToWhatsApp, 5000); // espera 5s antes de tentar de novo, evita martelar em loop
+        setTimeout(connectToWhatsApp, 5000);
       } else {
         console.log(`Sessão desconectada (logout) — limpando credenciais antigas e reiniciando pra gerar um QR novo.`);
         await limparCredenciaisAntigasDoBaileys();
@@ -846,7 +821,8 @@ async function connectToWhatsApp() {
   });
 
   sock.ev.on('messages.upsert', async ({ messages, type }) => {
-    if (type !== 'notify') return; // ignora replay de histórico sincronizado (comum após reconectar)
+    // Aceita 'notify' (tempo real) e 'append' (sincronização de mensagens/votos que chegam após reconectar de um restart)
+    if (type !== 'notify' && type !== 'append') return;
 
     for (const msg of messages) {
       await processarMensagem(msg).catch((err) => console.error('Erro processando uma mensagem do lote:', err.message));
@@ -857,53 +833,34 @@ async function connectToWhatsApp() {
     if (evento.action !== 'add' || persistBanidos.mapa.size === 0) return;
 
     for (const participantJid of evento.participants) {
-      if (await participantEstaNaLista(participantJid, persistProtegidos.mapa)) continue; // protegido nunca é removido, mesmo se também constar como banido
+      if (await participantEstaNaLista(participantJid, persistProtegidos.mapa)) continue;
       if (await participantEstaNaLista(participantJid, persistBanidos.mapa)) {
         console.log('Número banido entrou no grupo — removendo:', participantJid, 'do grupo', evento.id);
         try {
           await sock.groupParticipantsUpdate(evento.id, [participantJid], 'remove');
         } catch (err) {
-          console.error('Erro ao remover número banido (o bot é admin desse grupo?):', err.message);
+          console.error('Erro ao remover número banido:', err.message);
         }
       }
     }
   });
 
-  // Voto de enquete chega criptografado e incremental — só acumula aqui; a decriptação de verdade
-  // (manual, decryptPollVote) roda em resolverEnquete() quando a fase de enquete termina.
   sock.ev.on('messages.update', (updates) => {
     const estado = estadoDebate.get();
     if (estado.fase !== 'enquete' || !estado.pollMessageKey) {
-      const temPollUpdate = updates.some(({ update }) => update?.pollUpdates);
-      if (temPollUpdate) {
-        console.log('DIAGNÓSTICO ENQUETE: pollUpdates via messages.update chegou, mas fase não é mais \'enquete\' (ou sem pollMessageKey) —',
-          `fase=${estado.fase}`);
-      }
       return;
     }
 
     for (const { key, update } of updates) {
       if (!update.pollUpdates) continue;
       if (key.id !== estado.pollMessageKey.id || key.remoteJid !== estado.pollMessageKey.remoteJid) {
-        console.log('DIAGNÓSTICO ENQUETE: pollUpdates via messages.update NÃO bateu com a enquete atual —',
-          `pollMessageKey.id=${estado.pollMessageKey.id}, key.id=${key.id}`);
         continue;
       }
-      const estadoAgora = estadoDebate.get();
-      const conjuntoVotantes = new Set(estadoAgora.votantesConhecidos);
       for (const u of update.pollUpdates) {
-        const votanteJid = u.pollUpdateMessageKey?.participant || u.pollUpdateMessageKey?.remoteJid;
-        if (votanteJid) conjuntoVotantes.add(votanteJid);
+        const votanteJid = u.pollUpdateMessageKey?.participant || u.pollUpdateMessageKey?.remoteJid || u.voterJid;
+        acumularVotoSeguro(u, votanteJid);
       }
-      const votosNormalizados = update.pollUpdates.map((u) => ({
-        ...u,
-        voterJid: u.pollUpdateMessageKey?.participant || u.pollUpdateMessageKey?.remoteJid
-      }));
-      estadoDebate.set({
-        votosAcumulados: [...estadoAgora.votosAcumulados, ...votosNormalizados],
-        votantesConhecidos: [...conjuntoVotantes]
-      });
-      console.log(`DIAGNÓSTICO ENQUETE: voto via messages.update acumulado. Votantes até agora: ${conjuntoVotantes.size}`);
+      console.log(`Votos em enquete atualizados. Votantes únicos até agora: ${estadoDebate.get().votantesConhecidos.length}`);
     }
   });
 
@@ -912,7 +869,6 @@ async function connectToWhatsApp() {
 
     const msgId = msg.key.id;
     if (processedMessageIds.has(msgId)) {
-      console.log('Ignorada: id já processado (duplicata)', msgId);
       return;
     }
     processedMessageIds.add(msgId);
@@ -924,17 +880,11 @@ async function connectToWhatsApp() {
 
     const grupoId = msg.key.remoteJid;
     if (!grupoId || !grupoId.endsWith('@g.us')) {
-      console.log('Ignorada: não é uma mensagem de grupo (@g.us)');
       return;
     }
 
-    const tipoConteudo = Object.keys(msg.message)[0]; // ex: conversation, imageMessage, audioMessage...
+    const tipoConteudo = Object.keys(msg.message)[0];
 
-    // Voto de enquete: a documentação do Baileys diz que chega via messages.update, mas na
-    // prática (log confirma: "Ignorada: tipo não moderado — pollUpdateMessage") pelo menos
-    // parte dos votos chega aqui, via messages.upsert, como mensagem normal. Acumula do mesmo
-    // jeito que o listener de messages.update já faz, pro resolverEnquete usar depois — nunca
-    // vai pra moderação, voto não é conteúdo pra IA classificar.
     if (tipoConteudo === 'pollUpdateMessage') {
       const estado = estadoDebate.get();
       const votoMsg = msg.message.pollUpdateMessage;
@@ -942,34 +892,17 @@ async function connectToWhatsApp() {
         && votoMsg?.pollCreationMessageKey?.id === estado.pollMessageKey.id;
       if (éDaEnqueteAtual) {
         try {
-          // msg.key.participant identifica quem mandou o voto SEM precisar decriptar nada —
-          // isso já basta pra contar "quantas pessoas votaram" (o log de diagnóstico confirmou
-          // que getAggregateVotesInPollMessage devolve voters:[] mesmo com o voto acumulado
-          // certinho — decriptação quebrada nesse ambiente, então não dá pra confiar nela pra
-          // isso). Só a decriptação em si (saber QUAL opção) continua tentando via a função do
-          // Baileys, com fallback se falhar — ver resolverEnquete.
           const votanteJid = msg.key.participant || msg.participant || null;
-          const estadoAgora = estadoDebate.get();
-          const jaContabilizado = votanteJid && estadoAgora.votantesConhecidos.includes(votanteJid);
-          estadoDebate.set({
-            votosAcumulados: [
-              ...estadoAgora.votosAcumulados,
-              { pollUpdateMessageKey: msg.key, vote: votoMsg.vote, senderTimestampMs: votoMsg.senderTimestampMs, voterJid: votanteJid }
-            ],
-            votantesConhecidos: votanteJid && !jaContabilizado
-              ? [...estadoAgora.votantesConhecidos, votanteJid]
-              : estadoAgora.votantesConhecidos
-          });
-          console.log(`Voto de enquete recebido via messages.upsert e acumulado. Votante: ${votanteJid}. Votantes até agora: ${estadoDebate.get().votantesConhecidos.length}`);
+          acumularVotoSeguro({
+            pollUpdateMessageKey: msg.key,
+            vote: votoMsg.vote,
+            senderTimestampMs: votoMsg.senderTimestampMs,
+            voterJid: votanteJid
+          }, votanteJid);
+          console.log(`Voto de enquete via messages.upsert acumulado. Votante: ${votanteJid}. Votantes únicos: ${estadoDebate.get().votantesConhecidos.length}`);
         } catch (err) {
           console.error('Erro ao acumular voto de enquete (via upsert):', err.message);
         }
-      } else {
-        // Antes isso era ignorado em silêncio — se esse log aparecer durante uma enquete aberta,
-        // é sinal de que o voto chegou mas não bateu com o pollMessageKey que a gente rastreia
-        // (ou a fase já não era mais 'enquete' quando ele chegou), o que explicaria voto sumido.
-        console.log('DIAGNÓSTICO ENQUETE: pollUpdateMessage via upsert NÃO bateu com a enquete atual —',
-          `fase=${estado.fase}, pollMessageKey.id=${estado.pollMessageKey?.id}, votoMsg.pollCreationMessageKey.id=${votoMsg?.pollCreationMessageKey?.id}`);
       }
       return;
     }
@@ -1000,7 +933,6 @@ async function connectToWhatsApp() {
       tipo = 'documento';
       texto = msg.message.documentMessage?.caption || '';
     } else {
-      console.log('Ignorada: tipo não moderado —', tipoConteudo);
       return;
     }
 
@@ -1009,8 +941,6 @@ async function connectToWhatsApp() {
     const mensagensRecentes = contarMensagensRecentes(`${grupoId}:${participant}`);
     const podeDivulgar = await participantEstaNaLista(participant, persistLiberados.mapa);
 
-    // Tenta pegar um número de telefone de brinde, se o Baileys expuser em algum desses campos —
-    // nem sempre disponível (é a mesma limitação do @lid), então fica "—" quando não tiver.
     const possivelNumero = msg.key.senderPn || msg.key.participantPn || null;
     registrarContatoVisto(participant, remetente, grupoId, possivelNumero);
 
@@ -1025,14 +955,14 @@ async function connectToWhatsApp() {
         midiaBase64 = buffer.toString('base64');
         midiaMimeType = msg.message.imageMessage?.mimetype || 'image/jpeg';
       } catch (err) {
-        console.error('Erro ao baixar imagem (seguindo sem o conteúdo visual):', err.message);
+        console.error('Erro ao baixar imagem:', err.message);
       }
     } else if (tipo === 'audio' || tipo === 'audio_voz') {
       try {
         const buffer = await downloadMediaMessage(msg, 'buffer', {}, { logger: pino({ level: 'silent' }), reuploadRequest: sock.updateMediaMessage });
         audioBase64 = (await converterAudioParaMp3(buffer)).toString('base64');
       } catch (err) {
-        console.error('Erro ao baixar/converter áudio (seguindo só com duração/metadados):', err.message);
+        console.error('Erro ao baixar/converter áudio:', err.message);
       }
     } else if (tipo === 'video') {
       try {
@@ -1041,10 +971,10 @@ async function connectToWhatsApp() {
         try {
           audioBase64 = (await extrairAudioDoVideo(buffer)).toString('base64');
         } catch (errAudio) {
-          console.log('Vídeo sem trilha de áudio ou erro ao extrair (seguindo só com os frames):', errAudio.message);
+          console.log('Vídeo sem áudio:', errAudio.message);
         }
       } catch (err) {
-        console.error('Erro ao baixar/processar vídeo (seguindo só com duração/metadados):', err.message);
+        console.error('Erro ao baixar/processar vídeo:', err.message);
       }
     }
 
@@ -1069,15 +999,7 @@ async function connectToWhatsApp() {
       frames_base64: framesBase64
     };
 
-    console.log('Encaminhando pro n8n:', JSON.stringify({
-      ...payload,
-      midia_base64: midiaBase64 ? `[${midiaBase64.length} chars]` : null,
-      audio_base64: audioBase64 ? `[${audioBase64.length} chars]` : null,
-      frames_base64: framesBase64 ? `[${framesBase64.length} frames]` : null
-    }));
-
     if (!N8N_WEBHOOK_URL) {
-      console.warn('N8N_WEBHOOK_URL não configurada — mensagem recebida mas não encaminhada.');
       return;
     }
 
@@ -1088,7 +1010,7 @@ async function connectToWhatsApp() {
         body: JSON.stringify(payload)
       });
       if (!resp.ok) {
-        console.error(`n8n respondeu ${resp.status} ao receber a mensagem — confira se o fluxo está Active e se N8N_WEBHOOK_URL é a Production URL.`);
+        console.error(`n8n respondeu ${resp.status} ao receber a mensagem.`);
       }
     } catch (err) {
       console.error('Erro ao encaminhar mensagem pro n8n:', err.message);
@@ -1098,11 +1020,11 @@ async function connectToWhatsApp() {
 
 connectToWhatsApp();
 
-// --- Servidor HTTP: os dois endpoints que o n8n chama de volta ---
+// --- Servidor HTTP ---
 
 const app = express();
 app.use(express.json());
-app.use(express.urlencoded({ extended: true, limit: '5mb' })); // formulários HTML do /painel chegam nesse formato, não em JSON — limite maior por causa do import de tópicos em arquivo
+app.use(express.urlencoded({ extended: true, limit: '5mb' }));
 
 function escapeHtml(valor) {
   return String(valor ?? '').replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
@@ -1110,7 +1032,6 @@ function escapeHtml(valor) {
 
 function checkAuth(req, res, next) {
   if (!API_SECRET) {
-    console.warn('AVISO: API_SECRET não configurado — os endpoints /apagar e /avisar estão sem proteção.');
     return next();
   }
   if (req.headers['x-api-secret'] !== API_SECRET) {
@@ -1118,8 +1039,6 @@ function checkAuth(req, res, next) {
   }
   next();
 }
-
-// /painel fica sem autenticação, igual /qr e /contatos — mesma decisão que já valia pros outros dois.
 
 app.get('/health', (req, res) => {
   res.json({ ok: true, conectado: !!sock?.user });
@@ -1400,14 +1319,13 @@ app.post('/contatos/banir', (req, res) => {
   persistBanidos.mapa.set(identificador, { adicionadoEm: new Date().toISOString(), origem: 'painel' });
   persistBanidos.agendarSalvar();
 
-  // Já tenta remover de grupos que essa pessoa já foi vista — banir deveria tirar agora, não só bloquear entradas futuras.
   (async () => {
     const info = contatosVistos.get(identificador);
     if (info?.grupoId && sock) {
       try {
         await sock.groupParticipantsUpdate(info.grupoId, [identificador], 'remove');
       } catch (err) {
-        console.error('Ban manual: não consegui remover do grupo agora (o bot é admin lá?):', err.message);
+        console.error('Ban manual: erro ao remover do grupo:', err.message);
       }
     }
   })();
@@ -1438,20 +1356,16 @@ app.post('/contatos/liberar', async (req, res) => {
   let link = null;
 
   if (grupoId && sock) {
-    // NÃO chama groupParticipantsUpdate(..., 'add') — isso foi removido de propósito. Adicionar
-    // alguém de volta logo depois de remover é exatamente o padrão que fez o WhatsApp suspender
-    // um grupo de teste (detecção de abuso por entrada/saída automatizada). Buscar o link de
-    // convite é só leitura, não mexe em participante nenhum — quem manda o link é o admin, na mão.
     try {
       const codigo = await sock.groupInviteCode(grupoId);
       link = `https://chat.whatsapp.com/${codigo}`;
     } catch (err) {
-      console.error('Liberar: não consegui pegar o link de convite do grupo:', err.message);
+      console.error('Liberar: erro ao pegar link de convite:', err.message);
     }
     try {
       await enviarComDigitando(grupoId, `✅ ${info?.nome || identificador} liberado pra divulgação por autorização do admin`);
     } catch (err) {
-      console.error('Liberar: não consegui anunciar no grupo:', err.message);
+      console.error('Liberar: erro ao anunciar no grupo:', err.message);
     }
   }
 
@@ -1744,12 +1658,10 @@ app.post('/painel', (req, res) => {
     duracaoDebateHoras: parseFloat(duracaoDebateHoras) || 1,
     minVotosDebate: parseInt(minVotosDebate, 10) || 6
   });
-  if (estadoDebate.get().fase === 'normal') atualizarProximoDisparo(); // horário pode ter mudado — recalcula
+  if (estadoDebate.get().fase === 'normal') atualizarProximoDisparo();
   res.redirect('/painel');
 });
 
-// Aceita JSON (array de {tema, opcoes}) OU texto linha a linha ("tema | opção 1, opção 2").
-// Tenta JSON primeiro; se não for JSON válido, cai pro formato de linha.
 function parseTopicosDeArquivo(conteudo) {
   const topicos = [];
   let ignorados = 0;
@@ -1769,7 +1681,7 @@ function parseTopicosDeArquivo(conteudo) {
       return { topicos, ignorados };
     }
   } catch {
-    // não é JSON — cai pro formato linha a linha abaixo
+    // não é JSON
   }
 
   const linhas = conteudo.split('\n').map((l) => l.trim()).filter(Boolean);
@@ -1810,8 +1722,6 @@ app.post('/painel/topico', (req, res) => {
   res.redirect('/painel');
 });
 
-// Marca/desmarca 1 tópico específico como usado, na mão — pra curar a fila sem depender só do
-// consumo automático (ex: já foi debatido fora do ciclo, ou quer pular ele na próxima escolha).
 app.post('/painel/topico/marcar', (req, res) => {
   const { id, usado } = req.body;
   if (!id || !topicosEnquete.has(id)) return res.status(400).send('Tópico não encontrado.');
@@ -1820,8 +1730,6 @@ app.post('/painel/topico/marcar', (req, res) => {
   res.redirect('/painel');
 });
 
-// Marca todos os tópicos como não usados de novo — não mexe no ciclo em andamento (isso é o
-// /painel/resetar acima); esse aqui é só a fila de tópicos, pra reusar a mesma lista em testes.
 app.post('/painel/topicos/resetar', (req, res) => {
   let alterados = 0;
   for (const [id, topico] of topicosEnquete) {
@@ -1834,7 +1742,6 @@ app.post('/painel/topicos/resetar', (req, res) => {
   res.redirect('/painel?topicosResetados=1');
 });
 
-// Diferente do reset acima: esse apaga os tópicos de vez, não só desmarca "usado".
 app.post('/painel/topicos/apagar', (req, res) => {
   const quantidade = topicosEnquete.size;
   topicosEnquete.clear();
@@ -1842,9 +1749,6 @@ app.post('/painel/topicos/apagar', (req, res) => {
   res.redirect(`/painel?topicosApagados=${quantidade}`);
 });
 
-// Pra uso em teste: força o ciclo de volta pro normal sem esperar o prazo natural.
-// Desfaz tanto o estado interno quanto as configurações reais que o WhatsApp já aplicou no grupo
-// (senão o /painel diria "normal" mas o grupo continuaria travado em só-admin/aprovação de entrada).
 app.post('/painel/resetar', async (req, res) => {
   const estado = estadoDebate.get();
 
@@ -1875,7 +1779,7 @@ app.post('/painel/resetar', async (req, res) => {
     votosAcumulados: [],
     votantesConhecidos: [],
     topicoId: null,
-    ultimaMencaoEm: null // zera também, senão o intervalo de menção atrapalha o próximo teste
+    ultimaMencaoEm: null
   });
   atualizarProximoDisparo();
 
@@ -1949,8 +1853,7 @@ app.post('/registrar-violacao', checkAuth, async (req, res) => {
       const motivo = regra ? ` Regra violada: ${regra}.` : '';
       await enviarComDigitando(grupo_id, `⚠️ ${remetente || participant} foi removido do grupo automaticamente após atingir ${REMOVE_THRESHOLD} violações.${motivo}`);
     } catch (err) {
-      // Causa mais comum: este número não é admin do grupo, então o WhatsApp recusa a remoção.
-      console.error('Erro ao remover participante (o bot é admin do grupo?):', err.message);
+      console.error('Erro ao remover participante:', err.message);
       return res.status(500).json({ erro: err.message, contagem });
     }
   }
