@@ -210,7 +210,6 @@ async function garantirProtegidosDoDono() {
   }
 }
 
-
 // IDs de mensagem já processadas, pra nunca reagir duas vezes à mesma mensagem.
 // NÃO persiste: só protege contra reentrega quase-simultânea dentro da MESMA conexão ativa.
 // Depois de um restart é uma sessão nova — o cache começar vazio de novo não é problema.
@@ -545,6 +544,15 @@ async function iniciarCicloDebate() {
   }
 }
 
+// Garante que chaves e payloads lidos do arquivo JSON voltem a ser Buffer de verdade
+function garantirBuffer(val) {
+  if (!val) return val;
+  if (Buffer.isBuffer(val) || val instanceof Uint8Array) return Buffer.from(val);
+  if (val.type === 'Buffer' && Array.isArray(val.data)) return Buffer.from(val.data);
+  if (val.data && Array.isArray(val.data)) return Buffer.from(val.data);
+  return val;
+}
+
 // getAggregateVotesInPollMessage (a função pronta do Baileys) devolve voters:[] vazio nesse
 // ambiente — confirmado por log. A causa documentada: em grupos com @lid, a decriptação de voto
 // exige o JID de quem CRIOU a enquete no formato @lid (não @s.whatsapp.net) — e a função pronta
@@ -555,14 +563,28 @@ function descobrirOpcaoDoVoto(votoEntry, ctx) {
   const { pollEncKey, pollMsgId, opcoesHash, botLidNormalizado, botPn } = ctx;
   const candidatosCriador = [botLidNormalizado, botPn].filter(Boolean);
 
+  // 1. Encontra o JID de quem votou (cobre tanto messages.upsert quanto messages.update)
+  const voterJid = votoEntry.voterJid 
+    || votoEntry.pollUpdateMessageKey?.participant 
+    || votoEntry.key?.participant 
+    || votoEntry.pollUpdateMessageKey?.remoteJid;
+
+  // 2. Restaura os buffers criptografados caso tenham vindo do JSON após reinício
+  const voteSeguro = {
+    ...votoEntry.vote,
+    encPayload: garantirBuffer(votoEntry.vote?.encPayload),
+    encIv: garantirBuffer(votoEntry.vote?.encIv)
+  };
+
   for (const pollCreatorJid of candidatosCriador) {
     try {
-      const voteMsg = decryptPollVote(votoEntry.vote, {
+      const voteMsg = decryptPollVote(voteSeguro, {
         pollCreatorJid,
         pollMsgId,
-        pollEncKey,
-        voterJid: votoEntry.voterJid
+        pollEncKey: garantirBuffer(pollEncKey),
+        voterJid
       });
+
       const hashesEscolhidos = (voteMsg.selectedOptions || []).map((b) => Buffer.from(b).toString('hex'));
       for (const [opcaoTexto, hashOpcao] of opcoesHash) {
         if (hashesEscolhidos.includes(hashOpcao)) return { opcao: opcaoTexto, decriptou: true };
@@ -579,7 +601,8 @@ async function resolverEnquete() {
   const estado = estadoDebate.get();
   const cfg = configDebate.get();
   let debateComeca = false;
-  let temaVencedor = estado.tema; // some default: se não der pra apurar, usa a pergunta original da enquete
+  // CORREÇÃO: se não der pra apurar, usa a primeira opção da enquete como fallback (nunca a pergunta!)
+  let temaVencedor = estado.opcoes[0] || 'Tema geral';
 
   try {
     const mensagemCriacao = await getMessage(estado.pollMessageKey);
@@ -588,7 +611,7 @@ async function resolverEnquete() {
     const totalVotantes = new Set(estado.votantesConhecidos).size;
     console.log(`DIAGNÓSTICO ENQUETE: votantesConhecidos=${totalVotantes}, votosAcumulados.length=${estado.votosAcumulados.length}, mensagemCriacao encontrada=${!!mensagemCriacao}`);
 
-    const pollEncKey = mensagemCriacao?.messageContextInfo?.messageSecret;
+    const pollEncKey = garantirBuffer(mensagemCriacao?.messageContextInfo?.messageSecret);
     if (mensagemCriacao && pollEncKey && sock?.user) {
       try {
         const botPn = jidNormalizedUser(sock.user.id);
@@ -867,16 +890,17 @@ async function connectToWhatsApp() {
         continue;
       }
       const estadoAgora = estadoDebate.get();
-      // Esse caminho só juntava o CONTEÚDO do voto (votosAcumulados) e nunca marcava QUEM votou
-      // (votantesConhecidos) — só o outro listener (messages.upsert) fazia isso. Se o voto de
-      // alguém chegasse só por aqui, a pessoa nunca entrava na contagem, mesmo com o voto salvo.
       const conjuntoVotantes = new Set(estadoAgora.votantesConhecidos);
       for (const u of update.pollUpdates) {
-        const votanteJid = u.pollUpdateMessageKey?.participant;
+        const votanteJid = u.pollUpdateMessageKey?.participant || u.pollUpdateMessageKey?.remoteJid;
         if (votanteJid) conjuntoVotantes.add(votanteJid);
       }
+      const votosNormalizados = update.pollUpdates.map((u) => ({
+        ...u,
+        voterJid: u.pollUpdateMessageKey?.participant || u.pollUpdateMessageKey?.remoteJid
+      }));
       estadoDebate.set({
-        votosAcumulados: [...estadoAgora.votosAcumulados, ...update.pollUpdates],
+        votosAcumulados: [...estadoAgora.votosAcumulados, ...votosNormalizados],
         votantesConhecidos: [...conjuntoVotantes]
       });
       console.log(`DIAGNÓSTICO ENQUETE: voto via messages.update acumulado. Votantes até agora: ${conjuntoVotantes.size}`);
