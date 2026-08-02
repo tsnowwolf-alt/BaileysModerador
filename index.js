@@ -1050,9 +1050,15 @@ app.use(express.json());
 app.use(express.urlencoded({ extended: true, limit: '5mb' }));
 
 function escapeHtml(valor) {
-    return String(valor ?? '').replace(/[&<>"']/g, (c) =>
-        ({ '&': '&', '<': '<', '>': '>', '"': '"', "'": ''' }[c])
-    );
+  return String(valor ?? '').replace(/[&<>"']/g, (c) => {
+    return { 
+      '&': '&amp;', 
+      '<': '&lt;', 
+      '>': '&gt;', 
+      '"': '&quot;', 
+      "'": '&#39;' 
+    }[c];
+  });
 }
 
 function checkAuth(req, res, next) {
