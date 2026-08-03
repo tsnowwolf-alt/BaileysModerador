@@ -225,6 +225,44 @@ function contarMensagensRecentes(chave) {
   return lista.length;
 }
 
+// --- Repetição de verdade, não só volume ---
+//
+// `mensagens_recentes_60s` conta QUANTAS mensagens a pessoa mandou, não se elas eram iguais.
+// Mandar 7 mensagens diferentes e mandar a mesma 7 vezes davam exatamente o mesmo número, então
+// a IA não tinha como separar as duas coisas — e classificava conversa animada como spam.
+// Aqui o texto é normalizado e comparado com o que a pessoa mandou nos últimos minutos.
+const JANELA_REPETICAO_MS = 5 * 60_000;
+const MAX_HISTORICO_TEXTO = 30;
+const historicoTextos = new Map();
+
+// Compara pelo conteúdo, não pela forma: "OI!!!" , "oi" e "Oi..." são a mesma mensagem.
+function normalizarParaComparar(texto) {
+  return String(texto || '')
+    .toLowerCase()
+    .normalize('NFD').replace(/[\u0300-\u036f]/g, '')
+    .replace(/[^\p{L}\p{N}]+/gu, ' ')
+    .trim()
+    .replace(/\s+/g, ' ');
+}
+
+// Devolve quantas vezes ESTA mensagem apareceu na janela, contando a atual.
+// 1 = mensagem inédita. 2+ = repetiu.
+function contarRepeticoes(chave, texto) {
+  const alvo = normalizarParaComparar(texto);
+  if (!alvo) return 1;   // sem texto (imagem/áudio sem legenda) não dá pra comparar
+
+  const agora = Date.now();
+  const lista = (historicoTextos.get(chave) || []).filter((r) => agora - r.quando < JANELA_REPETICAO_MS);
+  const iguais = lista.filter((r) => r.txt === alvo).length;
+
+  lista.push({ txt: alvo, quando: agora });
+  if (lista.length > MAX_HISTORICO_TEXTO) lista.splice(0, lista.length - MAX_HISTORICO_TEXTO);
+  historicoTextos.set(chave, lista);
+  while (historicoTextos.size > 300) historicoTextos.delete(historicoTextos.keys().next().value);
+
+  return iguais + 1;
+}
+
 // Helper genérico pra persistir um Map em disco, dentro do AUTH_FOLDER.
 function criarMapaPersistente(nomeArquivo, { debounceMs = 2000 } = {}) {
   const mapa = new Map();
@@ -1646,6 +1684,7 @@ function extrairTextoDeContainer(conteudo, tipoConteudo) {
     const participant = msg.key.participant || grupoId;
     const remetente = msg.pushName || participant;
     const mensagensRecentes = contarMensagensRecentes(`${grupoId}:${participant}`);
+    const vezesQueRepetiu = contarRepeticoes(`${grupoId}:${participant}`, texto);
     const podeDivulgar = await participantEstaNaLista(participant, persistLiberados.mapa);
 
     const possivelNumero = msg.key.senderPn || msg.key.participantPn || null;
@@ -1697,6 +1736,10 @@ function extrairTextoDeContainer(conteudo, tipoConteudo) {
       texto,
       duracao_segundos: duracaoSegundos,
       mensagens_recentes_60s: mensagensRecentes,
+      // Quantas vezes ESTA mensagem apareceu nos últimos 5 min, contando a atual.
+      // 1 = inédita. 2+ = repetida. É este o campo que o prompt deve usar pra julgar spam.
+      mensagens_identicas_5min: vezesQueRepetiu,
+      mensagem_repetida: vezesQueRepetiu >= 2,
       pode_divulgar: podeDivulgar,
       debate_ativo: debateAtivo,
       tema_debate: debateAtivo ? estadoAtualDebate.tema : null,
