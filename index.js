@@ -420,7 +420,7 @@ const HORAS_RESGATE = Number(process.env.HORAS_RESGATE_MENSAGENS || 24);
 // regra, usa no texto do aviso e joga fora, e o texto da mensagem nunca sai do processarMensagem.
 // Regras do grupo, cadastradas aqui pra que o painel consiga traduzir "Regra 3" no texto da
 // regra. O n8n só devolve o número; sem esse cadastro, o número sozinho não diz nada a quem lê.
-const persistRegras = criarValorPersistente('regras.json', { regras: [], textoBruto: '', inicioNumeracao: 1 });
+const persistRegras = criarValorPersistente('regras.json', { regras: [], textoBruto: '' });
 
 const historicoModeracao = criarValorPersistente('historico-moderacao.json', { eventos: [] });
 const MAX_EVENTOS_HISTORICO = 400;
@@ -459,13 +459,37 @@ function registrarEventoModeracao(evento) {
 }
 
 // Último motivo conhecido de uma pessoa — é o que a tela de banidos mostra ao lado do nome.
+//
+// O n8n dispara "Apagar mensagem" e "Registrar violação" em ramos separados, sem ordem garantida.
+// Só o segundo carrega a regra. Se o de apagar chegar por último, uma busca ingênua pelo evento
+// mais recente devolveria um evento sem regra e o cartão diria "Sem regra registrada" — mesmo
+// com a regra tendo sido registrada segundos antes, na mesma punição.
+// Por isso: primeiro procura um evento que tenha regra E texto; se não houver, compõe a partir do
+// evento mais recente que tem regra e do mais recente que tem texto.
 function ultimoMotivoDe(identificador) {
   const eventos = historicoModeracao.get().eventos || [];
+  let comRegra = null;
+  let comTexto = null;
+
   for (let i = eventos.length - 1; i >= 0; i--) {
     const e = eventos[i];
-    if (e.participant === identificador && (e.regra || e.texto)) return e;
+    if (e.participant !== identificador) continue;
+
+    const temRegra = e.regra !== null && e.regra !== undefined && e.regra !== '';
+    const temTexto = !!(e.texto && e.texto.trim());
+
+    if (temRegra && temTexto) return e;
+    if (temRegra && !comRegra) comRegra = e;
+    if (temTexto && !comTexto) comTexto = e;
   }
-  return null;
+
+  if (!comRegra && !comTexto) return null;
+  return {
+    ...(comTexto || {}),
+    ...(comRegra || {}),
+    texto: comTexto?.texto || '',
+    tipo: comTexto?.tipo || comRegra?.tipo || null
+  };
 }
 
 // Histórico de boots. É o que separa "deploy normal" de "crash-loop": deploy dá 1 boot, crash-loop
@@ -2316,37 +2340,20 @@ app.get('/painel', (req, res) => {
 
 // Aceita os formatos que as pessoas realmente escrevem:
 //   1. Não divulgue produtos        3 - Respeite todos          Regra 5: proibido spam
-//
-// Regra de ouro: UMA LINHA = UMA REGRA. Linha sem número é numerada automaticamente, continuando
-// de onde a anterior parou — é isso que permite começar em 10 quando as regras 1 a 9 já existem
-// em outro lugar. Número explícito sempre manda, e a sequência segue a partir dele.
-//
-// A exceção é a linha INDENTADA (começa com espaço): essa é continuação da regra anterior, pra
-// que regra de vários parágrafos continue possível. Escolhi indentação em vez de "linha grudada"
-// porque colar uma lista de regras sem número, uma por linha, é o caso comum — e ali cada linha
-// precisa virar uma regra separada.
-function interpretarRegras(textoBruto, inicioNumeracao = 1) {
+// Linha sem número é continuação da regra anterior, então regra de vários parágrafos funciona —
+// é o que faz uma regra longa, colada com quebra de linha no meio, não virar duas.
+function interpretarRegras(textoBruto) {
   const regras = [];
-  let proximo = Math.max(1, Number(inicioNumeracao) || 1);
-
   for (const linha of String(textoBruto || '').split('\n')) {
     const limpa = linha.trim();
     if (!limpa) continue;
-
-    const indentada = /^[ \t]/.test(linha);
-    if (indentada && regras.length > 0) {
-      regras[regras.length - 1].texto += ` ${limpa}`;
-      continue;
-    }
-
     const casa = limpa.match(/^(?:regra\s*)?(\d{1,3})\s*[).:\-–]?\s+(.*)$/i);
     if (casa && casa[2]) {
-      const numero = Number(casa[1]);
-      regras.push({ numero, texto: casa[2].trim() });
-      proximo = numero + 1;
+      regras.push({ numero: Number(casa[1]), texto: casa[2].trim() });
+    } else if (regras.length > 0) {
+      regras[regras.length - 1].texto += ` ${limpa}`;
     } else {
-      regras.push({ numero: proximo, texto: limpa });
-      proximo++;
+      regras.push({ numero: regras.length + 1, texto: limpa });
     }
   }
   return regras;
@@ -2520,10 +2527,6 @@ app.get('/banidos', (req, res) => {
     .editor__dica { margin: 0 0 10px; font-size: 13px; color: var(--apagado); }
     .editor textarea { font: inherit; font-size: 14px; font-family: 'IBM Plex Mono', monospace; width: 100%; min-height: 190px; padding: 12px 14px; border: 1px solid var(--linha); border-radius: 9px; background: var(--papel); color: var(--tinta); resize: vertical; line-height: 1.6; }
     .editor textarea:focus-visible { outline: 2px solid var(--dourado); outline-offset: 1px; background: var(--superficie); }
-    .campo-inicio { display: flex; align-items: center; gap: 9px; flex-wrap: wrap; font-size: 13.5px; font-weight: 500; margin-bottom: 12px; }
-    .campo-inicio input { font: inherit; font-family: 'IBM Plex Mono', monospace; width: 78px; padding: 8px 10px; border: 1px solid var(--linha); border-radius: 8px; background: var(--papel); color: var(--tinta); }
-    .campo-inicio input:focus-visible { outline: 2px solid var(--dourado); outline-offset: 1px; background: var(--superficie); }
-    .campo-inicio span { font-weight: 400; font-size: 12.5px; color: var(--apagado); flex-basis: 100%; }
     .editor__resultado { margin: 14px 0 0; font-size: 13px; color: var(--apagado); display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }
     .contador-regras { font-family: 'IBM Plex Mono', monospace; font-size: 11px; font-weight: 500; color: var(--apagado); }
     .abas { display: flex; gap: 6px; flex-wrap: wrap; margin-bottom: 14px; }
@@ -2559,14 +2562,9 @@ app.get('/banidos', (req, res) => {
     <details class="editor" ${regrasCadastradas.length === 0 ? 'open' : ''}>
       <summary>Regras do grupo <span class="contador-regras">${regrasCadastradas.length} cadastrada(s)</span></summary>
       <div class="editor__corpo">
-        <p class="editor__dica">Uma regra por linha. Se a linha já vier numerada (<code>1.</code>, <code>2 -</code>, <code>Regra 3:</code>) esse número vale; se vier sem número, ele é atribuído automaticamente a partir do valor abaixo. Uma linha = uma regra. Para continuar a regra anterior num segundo parágrafo, comece a linha com um espaço.</p>
+        <p class="editor__dica">Uma regra por linha, começando pelo número. O painel usa isso pra mostrar o texto da regra ao lado de cada punição. Aceita <code>1.</code>, <code>2 -</code> ou <code>Regra 3:</code>.</p>
         <form method="POST" action="/banidos/regras">
-          <label class="campo-inicio">
-            Numerar a partir de
-            <input type="number" name="inicio" min="1" max="999" value="${Number(persistRegras.get().inicioNumeracao) || 1}">
-            <span>Use 10 se as regras 1 a 9 já existem no n8n.</span>
-          </label>
-          <textarea name="regras" placeholder="Não é permitido divulgar produtos, serviços ou links sem autorização do admin.&#10;Respeite todos os participantes: sem ofensas, discriminação ou assédio.&#10;Proibido conteúdo sexual, violento ou perturbador.">${escapeHtml(persistRegras.get().textoBruto || '')}</textarea>
+          <textarea name="regras" placeholder="1. Não é permitido divulgar produtos, serviços ou links sem autorização do admin.&#10;2. Respeite todos os participantes: sem ofensas, discriminação ou assédio.&#10;3. Proibido conteúdo sexual, violento ou perturbador.">${escapeHtml(persistRegras.get().textoBruto || '')}</textarea>
           <button class="botao" type="submit">Salvar regras</button>
         </form>
         ${regrasCadastradas.length > 0 ? `<p class="editor__resultado">Interpretado como: ${regrasCadastradas.map((r) => `<span class="selo-regra">Regra ${r.numero}</span>`).join('')}</p>` : ''}
@@ -2604,8 +2602,7 @@ app.get('/banidos', (req, res) => {
 
 app.post('/banidos/regras', (req, res) => {
   const textoBruto = String(req.body.regras || '');
-  const inicioNumeracao = Math.min(999, Math.max(1, Number(req.body.inicio) || 1));
-  persistRegras.set({ textoBruto, inicioNumeracao, regras: interpretarRegras(textoBruto, inicioNumeracao) });
+  persistRegras.set({ textoBruto, regras: interpretarRegras(textoBruto) });
   res.redirect('/banidos?salvo=1');
 });
 
