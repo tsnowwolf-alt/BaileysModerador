@@ -1331,6 +1331,62 @@ async function connectToWhatsApp() {
     }
   });
 
+// Mensagem com BOTÃO não é imageMessage nem conversation. O WhatsApp usa containers próprios
+// (templateMessage, interactiveMessage, buttonsMessage, listMessage...) que guardam o texto, a
+// imagem e os botões aninhados lá dentro. Spam de divulgação usa exatamente esses formatos, porque
+// é o que renderiza o botão de "GO"/CTA — e nenhum deles estava na lista de tipos tratados, então
+// a mensagem caía no `else` e ia embora sem chegar na moderação.
+//
+// Aqui o texto todo é achatado num blob só, incluindo o texto e a URL dos botões: é na URL que
+// mora a divulgação, e sem ela a IA não tem como julgar.
+function extrairTextoDeContainer(conteudo, tipoConteudo) {
+  const partes = [];
+  const add = (v) => { if (typeof v === 'string' && v.trim()) partes.push(v.trim()); };
+
+  if (tipoConteudo === 'templateMessage') {
+    const t = conteudo.templateMessage || {};
+    const modelo = t.hydratedTemplate || t.hydratedFourRowTemplate || t.fourRowTemplate || {};
+    add(modelo.hydratedTitle);
+    add(modelo.hydratedContentText);
+    add(modelo.hydratedFooterText);
+    add(modelo.imageMessage?.caption);
+    add(modelo.videoMessage?.caption);
+    add(modelo.documentMessage?.caption);
+    for (const b of modelo.hydratedButtons || []) {
+      add(b.urlButton?.displayText); add(b.urlButton?.url);
+      add(b.callButton?.displayText); add(b.callButton?.phoneNumber);
+      add(b.quickReplyButton?.displayText);
+    }
+  } else if (tipoConteudo === 'interactiveMessage') {
+    const i = conteudo.interactiveMessage || {};
+    add(i.header?.title); add(i.header?.subtitle); add(i.header?.imageMessage?.caption);
+    add(i.body?.text); add(i.footer?.text);
+    for (const b of i.nativeFlowMessage?.buttons || []) { add(b.name); add(b.buttonParamsJson); }
+  } else if (tipoConteudo === 'buttonsMessage') {
+    const b = conteudo.buttonsMessage || {};
+    add(b.contentText); add(b.footerText); add(b.imageMessage?.caption); add(b.documentMessage?.caption);
+    for (const bt of b.buttons || []) add(bt.buttonText?.displayText);
+  } else if (tipoConteudo === 'listMessage') {
+    const l = conteudo.listMessage || {};
+    add(l.title); add(l.description); add(l.footerText); add(l.buttonText);
+    for (const s of l.sections || []) {
+      add(s.title);
+      for (const r of s.rows || []) { add(r.title); add(r.description); }
+    }
+  } else if (tipoConteudo === 'productMessage') {
+    const p = conteudo.productMessage?.product || {};
+    add(p.title); add(p.description); add(p.url); add(p.retailerId);
+  } else if (tipoConteudo === 'groupInviteMessage') {
+    const g = conteudo.groupInviteMessage || {};
+    add(g.groupName); add(g.caption);
+    if (g.inviteCode) add(`https://chat.whatsapp.com/${g.inviteCode}`);
+  } else {
+    return null;
+  }
+
+  return partes.length > 0 ? partes.join('\n') : null;
+}
+
   async function processarMensagem(msg, type, tetoDoLote) {
     if (!msg?.message) return;
 
@@ -1429,14 +1485,22 @@ async function connectToWhatsApp() {
       tipo = 'documento';
       texto = conteudo.documentMessage?.caption || '';
     } else {
-      // Tipos que não são conteúdo de usuário (protocolMessage, reaction, etc.) passam por aqui
-      // o tempo todo — mas se for algo com texto que a gente não trata, o log abaixo é a única
-      // forma de descobrir. Antes esse `return` era mudo e a mensagem simplesmente sumia.
-      const silenciosos = new Set(['protocolMessage', 'reactionMessage', 'senderKeyDistributionMessage', 'messageContextInfo', 'pollCreationMessage', null]);
-      if (!silenciosos.has(tipoConteudo)) {
-        console.log(`[NÃO MODERADA] Tipo não tratado: ${tipoConteudo} | chaves do envelope: ${Object.keys(msg.message).join(',')} | id=${msgId}`);
+      // Antes de desistir: mensagem com botão/template guarda o conteúdo aninhado num container.
+      const textoContainer = extrairTextoDeContainer(conteudo, tipoConteudo);
+      if (textoContainer) {
+        tipo = 'texto';
+        texto = textoContainer;
+        console.log(`[CONTAINER] ${tipoConteudo} (mensagem com botão/CTA) — texto extraído e enviado pra moderação. id=${msgId}`);
+      } else {
+        // Tipos que não são conteúdo de usuário (protocolMessage, reaction, etc.) passam por aqui
+        // o tempo todo — mas se for algo com texto que a gente não trata, o log abaixo é a única
+        // forma de descobrir. Antes esse `return` era mudo e a mensagem simplesmente sumia.
+        const silenciosos = new Set(['protocolMessage', 'reactionMessage', 'senderKeyDistributionMessage', 'messageContextInfo', 'pollCreationMessage', null]);
+        if (!silenciosos.has(tipoConteudo)) {
+          console.log(`[NÃO MODERADA] Tipo não tratado: ${tipoConteudo} | chaves do envelope: ${Object.keys(msg.message).join(',')} | id=${msgId}`);
+        }
+        return;
       }
-      return;
     }
 
     registrarMensagemVista(msgId, tsMsg);
