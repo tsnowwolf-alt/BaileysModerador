@@ -415,6 +415,55 @@ const marcaDagua = criarValorPersistente('marca-dagua-mensagens.json', {
 // Evita que uma perda do volume vire uma avalanche de moderação retroativa.
 const HORAS_RESGATE = Number(process.env.HORAS_RESGATE_MENSAGENS || 24);
 
+// Histórico de moderação: cada aviso, exclusão, violação, remoção e banimento vira um evento.
+// Sem isso não existe "por que essa pessoa foi banida" — hoje o /registrar-violacao recebe a
+// regra, usa no texto do aviso e joga fora, e o texto da mensagem nunca sai do processarMensagem.
+const historicoModeracao = criarValorPersistente('historico-moderacao.json', { eventos: [] });
+const MAX_EVENTOS_HISTORICO = 400;
+
+// Últimas mensagens vistas, pra recuperar o texto na hora em que o n8n manda apagar/punir.
+// Fica só em memória de propósito: gravar cada mensagem do grupo em disco seria I/O demais, e a
+// punição chega segundos depois da mensagem. Se o processo reiniciar nesse meio, o texto some —
+// por isso os endpoints também aceitam `texto` no corpo, pra quem quiser garantia total.
+const mensagensRecentes = new Map();
+const MAX_MENSAGENS_CACHE = 400;
+
+function guardarMensagemRecente(grupoId, participant, messageId, texto, tipo) {
+  const registro = { messageId, texto: texto || '', tipo, quando: new Date().toISOString() };
+  if (messageId) mensagensRecentes.set(`msg:${grupoId}:${messageId}`, registro);
+  if (participant) mensagensRecentes.set(`autor:${grupoId}:${participant}`, registro);
+  while (mensagensRecentes.size > MAX_MENSAGENS_CACHE) {
+    mensagensRecentes.delete(mensagensRecentes.keys().next().value);
+  }
+}
+
+function buscarMensagemRecente(grupoId, participant, messageId) {
+  return mensagensRecentes.get(`msg:${grupoId}:${messageId}`)
+    || mensagensRecentes.get(`autor:${grupoId}:${participant}`)
+    || null;
+}
+
+function registrarEventoModeracao(evento) {
+  const anteriores = historicoModeracao.get().eventos || [];
+  const completo = {
+    id: `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+    quando: new Date().toISOString(),
+    ...evento
+  };
+  historicoModeracao.set({ eventos: [...anteriores, completo].slice(-MAX_EVENTOS_HISTORICO) });
+  return completo;
+}
+
+// Último motivo conhecido de uma pessoa — é o que a tela de banidos mostra ao lado do nome.
+function ultimoMotivoDe(identificador) {
+  const eventos = historicoModeracao.get().eventos || [];
+  for (let i = eventos.length - 1; i >= 0; i--) {
+    const e = eventos[i];
+    if (e.participant === identificador && (e.regra || e.texto)) return e;
+  }
+  return null;
+}
+
 // Histórico de boots. É o que separa "deploy normal" de "crash-loop": deploy dá 1 boot, crash-loop
 // dá vários seguidos com poucos segundos entre eles.
 const historicoBoots = criarValorPersistente('boots.json', { boots: [] });
@@ -651,6 +700,7 @@ async function flushTudo() {
     persistTopicos.flush(),
     persistMensagensEnviadas.flush(),
     marcaDagua.flush(),
+    historicoModeracao.flush(),
     persistBanidos.flush(),
     persistLiberados.flush(),
     persistProtegidos.flush()
@@ -1184,7 +1234,7 @@ async function verificarCicloDebate() {
 const ARQUIVOS_PROPRIOS_NO_AUTH_FOLDER = new Set([
   'contatos.json', 'violations.json', 'config-debate.json', 'estado-debate.json',
   'topicos-enquete.json', 'mensagens-enviadas.json', 'numeros-banidos.json', 'numeros-liberados.json',
-  'numeros-protegidos.json', 'marca-dagua-mensagens.json', 'boots.json'
+  'numeros-protegidos.json', 'marca-dagua-mensagens.json', 'boots.json', 'historico-moderacao.json'
 ]);
 
 async function limparCredenciaisAntigasDoBaileys() {
@@ -1208,6 +1258,7 @@ async function connectToWhatsApp() {
     persistTopicos.carregar(),
     persistMensagensEnviadas.carregar(),
     marcaDagua.carregar(),
+    historicoModeracao.carregar(),
     registrarBoot(),
     semearListaDoEnvSeVazia(persistBanidos, 'NUMEROS_BANIDOS', 'Números banidos'),
     semearListaDoEnvSeVazia(persistLiberados, 'NUMEROS_LIBERADOS_DIVULGACAO', 'Números liberados pra divulgação'),
@@ -1505,6 +1556,10 @@ function extrairTextoDeContainer(conteudo, tipoConteudo) {
 
     registrarMensagemVista(msgId, tsMsg);
 
+    // Guarda o texto pra poder mostrar depois "foi isso que causou o banimento". O n8n só devolve
+    // grupo_id/participant/regra — sem esse cache, o motivo do ban seria sempre um vazio.
+    guardarMensagemRecente(grupoId, msg.key.participant || msg.key.remoteJid, msgId, texto, tipo);
+
     const participant = msg.key.participant || grupoId;
     const remetente = msg.pushName || participant;
     const mensagensRecentes = contarMensagensRecentes(`${grupoId}:${participant}`);
@@ -1794,6 +1849,7 @@ app.get('/contatos', (req, res) => {
           <header class="cabecalho">
             <h1>Pessoas vistas nos grupos</h1>
             <p>Clique no identificador pra copiar. A coluna "Número" só aparece quando o WhatsApp expõe (nem sempre disponível).</p>
+            <p style="margin-top:10px;"><a href="/banidos" style="font-size:13px;font-weight:500;text-decoration:none;color:var(--tinta);background:var(--superficie);border:1px solid var(--linha);padding:7px 13px;border-radius:999px;display:inline-block;">🚫 Banidos e histórico</a></p>
           </header>
 
           ${aviso}
@@ -1888,8 +1944,22 @@ app.post('/contatos/banir', (req, res) => {
   persistBanidos.mapa.set(identificador, { adicionadoEm: new Date().toISOString(), origem: 'painel' });
   persistBanidos.agendarSalvar();
 
+  const info = contatosVistos.get(identificador);
+  const ultimo = ultimoMotivoDe(identificador);
+  registrarEventoModeracao({
+    acao: 'banido',
+    grupoId: info?.grupoId || null,
+    participant: identificador,
+    remetente: info?.nome || null,
+    // Ban manual não tem regra própria — herda o último motivo registrado da pessoa, que é o
+    // que normalmente motivou o admin a banir.
+    regra: ultimo?.regra ?? null,
+    texto: ultimo?.texto || '',
+    tipo: ultimo?.tipo || null,
+    origem: 'painel'
+  });
+
   (async () => {
-    const info = contatosVistos.get(identificador);
     if (info?.grupoId && sock) {
       try {
         await sock.groupParticipantsUpdate(info.grupoId, [identificador], 'remove');
@@ -2079,6 +2149,7 @@ app.get('/painel', (req, res) => {
           <header class="cabecalho">
             <h1>Mesa de Debate</h1>
             <p>Enquete e debate diário do grupo</p>
+            <p style="margin-top:10px;"><a href="/banidos" style="font-size:13px;font-weight:500;text-decoration:none;color:var(--tinta);background:var(--superficie);border:1px solid var(--linha);padding:7px 13px;border-radius:999px;display:inline-block;">🚫 Banidos e histórico</a></p>
           </header>
 
           <div class="ticket ${infoFase.classe}">
@@ -2214,6 +2285,243 @@ app.get('/painel', (req, res) => {
       </body>
     </html>
   `);
+});
+
+const ROTULOS_ACAO = {
+  apagada: { texto: 'Mensagem apagada', classe: 'dourado', icone: '🧹' },
+  violacao: { texto: 'Violação registrada', classe: 'dourado', icone: '⚠️' },
+  removido: { texto: 'Removido do grupo', classe: 'vermelho', icone: '🚪' },
+  banido: { texto: 'Banido', classe: 'vermelho', icone: '🚫' },
+  aviso: { texto: 'Aviso enviado', classe: 'verde', icone: '💬' }
+};
+
+function selosDeRegra(regra) {
+  if (regra === null || regra === undefined || regra === '') return '';
+  const bruto = String(regra);
+  // A IA pode devolver "3", "regra 3", "3, 7" ou uma frase. Se der pra achar números, vira selo
+  // numerado; se for frase, mostra a frase inteira sem tentar adivinhar.
+  const numeros = bruto.match(/\d+/g);
+  if (numeros && numeros.length > 0 && bruto.replace(/[\d,;\s.\-–]|regras?/gi, '').length === 0) {
+    return numeros.map((n) => `<span class="selo-regra">Regra ${n}</span>`).join('');
+  }
+  return `<span class="selo-regra selo-regra--texto">${escapeHtml(bruto)}</span>`;
+}
+
+function trechoDoTexto(texto, tipo) {
+  if (!texto || !texto.trim()) {
+    const rotuloTipo = tipo && tipo !== 'texto' ? ` (${escapeHtml(tipo)})` : '';
+    return `<p class="citacao citacao--vazia">Texto não capturado${rotuloTipo}</p>`;
+  }
+  const limpo = escapeHtml(texto.length > 600 ? `${texto.slice(0, 600)}…` : texto);
+  return `<p class="citacao">${limpo.replace(/\n/g, '<br>')}</p>`;
+}
+
+app.get('/banidos', (req, res) => {
+  const eventos = [...(historicoModeracao.get().eventos || [])].reverse();
+  const filtroAcao = req.query.acao || '';
+
+  const nomeDe = (id, fallback) => fallback || contatosVistos.get(id)?.nome || 'Nome desconhecido';
+
+  const cartoesBanidos = [...persistBanidos.mapa.entries()]
+    .sort((a, b) => new Date(b[1].adicionadoEm) - new Date(a[1].adicionadoEm))
+    .map(([id, info]) => {
+      const contato = contatosVistos.get(id);
+      const motivo = ultimoMotivoDe(id);
+      const numero = contato?.numero ? `<span class="pessoa__numero">${escapeHtml(contato.numero)}</span>` : '';
+      const busca = `${contato?.nome || ''} ${contato?.numero || ''} ${id} ${motivo?.texto || ''} ${motivo?.regra || ''}`.toLowerCase();
+
+      return `
+      <article class="pessoa" data-busca="${escapeHtml(busca)}">
+        <header class="pessoa__topo">
+          <div>
+            <h3 class="pessoa__nome">${escapeHtml(nomeDe(id, contato?.nome))}</h3>
+            ${numero}
+            <code class="copiavel" data-copiar="${escapeHtml(id)}" title="Clique pra copiar">${escapeHtml(id)}</code>
+          </div>
+          <form method="POST" action="/contatos/banir/remover">
+            <input type="hidden" name="identificador" value="${id}">
+            <button class="botao-secundario" type="submit">Desbanir</button>
+          </form>
+        </header>
+
+        <div class="pessoa__motivo">
+          <div class="rotulo-linha">
+            <span class="rotulo">Motivo</span>
+            ${selosDeRegra(motivo?.regra) || '<span class="selo-regra selo-regra--vazio">Sem regra registrada</span>'}
+          </div>
+          ${trechoDoTexto(motivo?.texto, motivo?.tipo)}
+        </div>
+
+        <footer class="pessoa__rodape">
+          Banido em ${new Date(info.adicionadoEm).toLocaleString('pt-BR', { timeZone: FUSO_HORARIO })}
+          ${info.origem === 'env' ? ' · migrado da variável de ambiente' : info.origem === 'painel' ? ' · pelo painel' : ''}
+        </footer>
+      </article>`;
+    })
+    .join('');
+
+  const linhasHistorico = eventos
+    .filter((e) => !filtroAcao || e.acao === filtroAcao)
+    .map((e) => {
+      const rotulo = ROTULOS_ACAO[e.acao] || { texto: e.acao, classe: 'neutro', icone: '•' };
+      const busca = `${e.remetente || ''} ${e.participant || ''} ${e.texto || ''} ${e.regra || ''}`.toLowerCase();
+      const contagem = e.contagem ? `<span class="pilula">${e.contagem}ª violação</span>` : '';
+
+      return `
+      <article class="evento evento--${rotulo.classe}" data-busca="${escapeHtml(busca)}">
+        <div class="evento__cabeca">
+          <span class="selo-acao selo-acao--${rotulo.classe}">${rotulo.icone} ${rotulo.texto}</span>
+          ${selosDeRegra(e.regra)}
+          ${contagem}
+          <time class="evento__quando">${new Date(e.quando).toLocaleString('pt-BR', { timeZone: FUSO_HORARIO })}</time>
+        </div>
+        <p class="evento__quem">
+          <strong>${escapeHtml(nomeDe(e.participant, e.remetente))}</strong>
+          <code class="copiavel" data-copiar="${escapeHtml(e.participant || '')}">${escapeHtml(e.participant || '—')}</code>
+        </p>
+        ${trechoDoTexto(e.texto, e.tipo)}
+      </article>`;
+    })
+    .join('');
+
+  const contagens = eventos.reduce((acc, e) => { acc[e.acao] = (acc[e.acao] || 0) + 1; return acc; }, {});
+  const abas = [['', 'Tudo', eventos.length], ...Object.keys(ROTULOS_ACAO).map((a) => [a, ROTULOS_ACAO[a].texto, contagens[a] || 0])]
+    .filter(([chave, , n]) => chave === '' || n > 0)
+    .map(([chave, nome, n]) => `<a class="aba ${filtroAcao === chave ? 'aba--ativa' : ''}" href="/banidos${chave ? `?acao=${chave}` : ''}">${nome} <span>${n}</span></a>`)
+    .join('');
+
+  res.send(`<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Banidos e histórico</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Fraunces:opsz,wght@9..144,600&family=IBM+Plex+Mono:wght@400;500&family=IBM+Plex+Sans:wght@400;500;600&display=swap" rel="stylesheet">
+  <style>
+    :root {
+      --tinta: #1B2340; --papel: #EEF0F4; --superficie: #FFFFFF;
+      --dourado: #C99A2E; --dourado-suave: #F3E6C6;
+      --vermelho: #B23A2E; --vermelho-suave: #F4DCD8;
+      --verde: #3F7859; --verde-suave: #DCEBE2;
+      --linha: #DADCE3; --apagado: #5B6178;
+    }
+    * { box-sizing: border-box; }
+    body { margin: 0; background: var(--papel); color: var(--tinta); font-family: 'IBM Plex Sans', -apple-system, sans-serif; -webkit-font-smoothing: antialiased; line-height: 1.5; }
+    .envelope { max-width: 780px; margin: 0 auto; padding: 28px 18px 64px; }
+
+    .cabecalho h1 { font-family: 'Fraunces', Georgia, serif; font-size: 28px; font-weight: 600; letter-spacing: -0.01em; margin: 0 0 4px; }
+    .cabecalho p { margin: 0; color: var(--apagado); font-size: 14px; }
+    .navegacao { display: flex; gap: 8px; margin: 16px 0 0; flex-wrap: wrap; }
+    .navegacao a { font-size: 13px; font-weight: 500; text-decoration: none; color: var(--tinta); background: var(--superficie); border: 1px solid var(--linha); padding: 7px 13px; border-radius: 999px; }
+    .navegacao a:hover { border-color: var(--tinta); }
+
+    .busca { margin-top: 20px; position: relative; }
+    .busca input { font: inherit; font-size: 15px; width: 100%; padding: 12px 14px 12px 40px; border: 1px solid var(--linha); border-radius: 10px; background: var(--superficie); color: var(--tinta); }
+    .busca input:focus-visible { outline: 2px solid var(--dourado); outline-offset: 1px; }
+    .busca::before { content: '🔎'; position: absolute; left: 13px; top: 50%; transform: translateY(-50%); font-size: 15px; opacity: 0.55; }
+
+    .secao { margin-top: 34px; }
+    .secao__olho { font-family: 'IBM Plex Mono', monospace; font-size: 11px; letter-spacing: 0.08em; text-transform: uppercase; color: var(--dourado); font-weight: 500; margin: 0 0 4px; }
+    .secao h2 { font-family: 'Fraunces', Georgia, serif; font-size: 21px; font-weight: 600; margin: 0 0 14px; }
+
+    .pessoa { background: var(--superficie); border: 1px solid var(--linha); border-left: 5px solid var(--vermelho); border-radius: 12px; padding: 16px 18px; margin-bottom: 12px; }
+    .pessoa__topo { display: flex; align-items: flex-start; justify-content: space-between; gap: 12px; }
+    .pessoa__nome { font-family: 'Fraunces', Georgia, serif; font-size: 17px; font-weight: 600; margin: 0 0 2px; }
+    .pessoa__numero { display: block; font-size: 13px; color: var(--apagado); margin-bottom: 4px; }
+    .pessoa__motivo { margin-top: 12px; padding-top: 12px; border-top: 1px dashed var(--linha); }
+    .pessoa__rodape { margin-top: 10px; font-family: 'IBM Plex Mono', monospace; font-size: 11.5px; color: var(--apagado); }
+
+    .rotulo-linha { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin-bottom: 7px; }
+    .rotulo { font-family: 'IBM Plex Mono', monospace; font-size: 10.5px; letter-spacing: 0.07em; text-transform: uppercase; color: var(--apagado); }
+
+    .selo-regra { display: inline-block; background: var(--vermelho-suave); color: #7A2A20; font-size: 12px; font-weight: 600; padding: 3px 10px; border-radius: 999px; }
+    .selo-regra--texto { background: var(--dourado-suave); color: #6B4E14; font-weight: 500; }
+    .selo-regra--vazio { background: var(--papel); color: var(--apagado); font-weight: 400; }
+
+    .citacao { margin: 0; background: var(--papel); border-radius: 8px; padding: 11px 13px; font-size: 14.5px; white-space: pre-wrap; word-break: break-word; border-left: 3px solid var(--linha); }
+    .citacao--vazia { color: var(--apagado); font-style: italic; font-size: 13.5px; }
+
+    .abas { display: flex; gap: 6px; flex-wrap: wrap; margin-bottom: 14px; }
+    .aba { font-size: 13px; text-decoration: none; color: var(--apagado); background: var(--superficie); border: 1px solid var(--linha); padding: 6px 12px; border-radius: 999px; }
+    .aba span { font-family: 'IBM Plex Mono', monospace; font-size: 11px; opacity: 0.7; }
+    .aba--ativa { background: var(--tinta); color: #fff; border-color: var(--tinta); }
+
+    .evento { background: var(--superficie); border: 1px solid var(--linha); border-left: 4px solid var(--linha); border-radius: 10px; padding: 13px 15px; margin-bottom: 10px; }
+    .evento--vermelho { border-left-color: var(--vermelho); }
+    .evento--dourado { border-left-color: var(--dourado); }
+    .evento--verde { border-left-color: var(--verde); }
+    .evento__cabeca { display: flex; align-items: center; gap: 7px; flex-wrap: wrap; margin-bottom: 7px; }
+    .evento__quando { margin-left: auto; font-family: 'IBM Plex Mono', monospace; font-size: 11.5px; color: var(--apagado); }
+    .evento__quem { margin: 0 0 8px; font-size: 14px; display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+    .selo-acao { font-size: 12px; font-weight: 600; padding: 3px 10px; border-radius: 999px; }
+    .selo-acao--vermelho { background: var(--vermelho-suave); color: #7A2A20; }
+    .selo-acao--dourado { background: var(--dourado-suave); color: #6B4E14; }
+    .selo-acao--verde { background: var(--verde-suave); color: #1F4A34; }
+    .selo-acao--neutro { background: var(--papel); color: var(--apagado); }
+    .pilula { font-family: 'IBM Plex Mono', monospace; font-size: 11px; background: var(--papel); color: var(--apagado); padding: 3px 8px; border-radius: 999px; }
+
+    .copiavel { background: var(--papel); padding: 2px 7px; border-radius: 5px; font-family: 'IBM Plex Mono', monospace; font-size: 11.5px; cursor: pointer; display: inline-block; word-break: break-all; }
+    .botao-secundario { font: inherit; font-weight: 600; font-size: 12.5px; padding: 7px 12px; border-radius: 8px; border: 1px solid var(--vermelho); background: transparent; color: var(--vermelho); cursor: pointer; white-space: nowrap; }
+    .botao-secundario:hover { background: var(--vermelho-suave); }
+
+    .vazio { background: var(--superficie); border: 1px dashed var(--linha); border-radius: 12px; padding: 28px 20px; text-align: center; color: var(--apagado); font-size: 14px; }
+    .vazio strong { display: block; font-family: 'Fraunces', Georgia, serif; font-size: 16px; color: var(--tinta); margin-bottom: 4px; }
+
+    @media (max-width: 520px) {
+      .pessoa__topo { flex-direction: column; }
+      .evento__quando { margin-left: 0; width: 100%; }
+    }
+  </style>
+</head>
+<body>
+  <div class="envelope">
+    <header class="cabecalho">
+      <h1>Banidos e histórico</h1>
+      <p>Quem está banido, o que a pessoa escreveu e qual regra foi apontada.</p>
+      <nav class="navegacao">
+        <a href="/painel">← Painel</a>
+        <a href="/contatos">Contatos</a>
+      </nav>
+    </header>
+
+    <div class="busca">
+      <input id="campoBusca" type="text" placeholder="Buscar por nome, número, texto ou regra…" autocomplete="off">
+    </div>
+
+    <section class="secao">
+      <p class="secao__olho">Lista de bloqueio</p>
+      <h2>Banidos agora (${persistBanidos.mapa.size})</h2>
+      ${cartoesBanidos || '<div class="vazio"><strong>Ninguém banido</strong>A lista de bloqueio está vazia.</div>'}
+    </section>
+
+    <section class="secao">
+      <p class="secao__olho">Linha do tempo</p>
+      <h2>Histórico de moderação</h2>
+      <div class="abas">${abas}</div>
+      ${linhasHistorico || '<div class="vazio"><strong>Nada registrado ainda</strong>O histórico começa a partir da primeira ação de moderação depois desta atualização.</div>'}
+    </section>
+  </div>
+
+  <script>
+    // Copiar via delegação, não via onclick inline: o identificador vem de fora e, interpolado
+    // dentro de uma string JS num atributo, conseguia escapar dela.
+    document.addEventListener('click', (ev) => {
+      const alvo = ev.target.closest('[data-copiar]');
+      if (alvo) navigator.clipboard.writeText(alvo.dataset.copiar);
+    });
+
+    const campo = document.getElementById('campoBusca');
+    campo.addEventListener('input', () => {
+      const termo = campo.value.trim().toLowerCase();
+      for (const item of document.querySelectorAll('[data-busca]')) {
+        item.style.display = !termo || item.dataset.busca.includes(termo) ? '' : 'none';
+      }
+    });
+  </script>
+</body>
+</html>`);
 });
 
 app.post('/painel', (req, res) => {
@@ -2376,6 +2684,19 @@ app.post('/apagar', checkAuth, async (req, res) => {
         fromMe: false
       }
     });
+
+    const cache = buscarMensagemRecente(grupo_id, participant, message_id);
+    registrarEventoModeracao({
+      acao: 'apagada',
+      grupoId: grupo_id,
+      participant,
+      remetente: req.body.remetente || contatosVistos.get(participant)?.nome || null,
+      regra: req.body.regra ?? null,
+      texto: req.body.texto || cache?.texto || '',
+      tipo: cache?.tipo || null,
+      messageId: message_id
+    });
+
     res.json({ ok: true });
   } catch (err) {
     console.error('Erro ao apagar mensagem:', err.message);
@@ -2414,6 +2735,10 @@ app.post('/registrar-violacao', checkAuth, async (req, res) => {
   violationCounts.set(chave, contagem);
   persistViolacoes.agendarSalvar();
 
+  const cache = buscarMensagemRecente(grupo_id, participant, req.body.message_id);
+  const textoDaVez = req.body.texto || cache?.texto || '';
+  const nomeDaVez = remetente || contatosVistos.get(participant)?.nome || null;
+
   let removido = false;
 
   if (contagem >= REMOVE_THRESHOLD) {
@@ -2429,6 +2754,18 @@ app.post('/registrar-violacao', checkAuth, async (req, res) => {
       return res.status(500).json({ erro: err.message, contagem });
     }
   }
+
+  registrarEventoModeracao({
+    acao: removido ? 'removido' : 'violacao',
+    grupoId: grupo_id,
+    participant,
+    remetente: nomeDaVez,
+    regra: regra ?? null,
+    texto: textoDaVez,
+    tipo: cache?.tipo || null,
+    messageId: req.body.message_id || cache?.messageId || null,
+    contagem: removido ? REMOVE_THRESHOLD : contagem
+  });
 
   res.json({ ok: true, contagem, removido });
 });
