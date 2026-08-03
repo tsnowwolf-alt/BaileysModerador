@@ -337,6 +337,58 @@ function criarValorPersistente(nomeArquivo, valorPadrao, { debounceMs = 2000 } =
 const persistViolacoes = criarMapaPersistente('violations.json');
 const violationCounts = persistViolacoes.mapa;
 
+// Violação não é permanente: depois de HORAS_RESET_VIOLACOES sem infringir, a ficha da pessoa
+// volta a zero. O relógio conta a partir da ÚLTIMA violação, não de um horário fixo do dia —
+// ou seja, é preciso ficar 24h limpo pra zerar, não basta esperar a meia-noite.
+const HORAS_RESET_VIOLACOES = Number(process.env.HORAS_RESET_VIOLACOES || 24);
+
+// Lê a contagem já aplicando a expiração. Entende o formato antigo (número puro) pra não perder
+// o que já está gravado em violations.json.
+function lerViolacoes(chave) {
+  const bruto = violationCounts.get(chave);
+  if (bruto === null || bruto === undefined) return { contagem: 0, expirou: false, contagemAnterior: 0 };
+
+  const contagem = typeof bruto === 'number' ? bruto : Number(bruto.contagem) || 0;
+  const ultimaEm = typeof bruto === 'number' ? null : bruto.ultimaEm;
+  if (!ultimaEm) return { contagem, expirou: false, contagemAnterior: contagem };
+
+  const idadeMs = Date.now() - new Date(ultimaEm).getTime();
+  if (Number.isFinite(idadeMs) && idadeMs >= HORAS_RESET_VIOLACOES * 3600_000) {
+    return { contagem: 0, expirou: contagem > 0, contagemAnterior: contagem };
+  }
+  return { contagem, expirou: false, contagemAnterior: contagem };
+}
+
+function anotarViolacao(chave) {
+  const antes = lerViolacoes(chave);
+  const contagem = antes.contagem + 1;
+  violationCounts.set(chave, { contagem, ultimaEm: new Date().toISOString() });
+  persistViolacoes.agendarSalvar();
+  return { contagem, expirou: antes.expirou, contagemAnterior: antes.contagemAnterior };
+}
+
+function zerarViolacoes(chave) {
+  violationCounts.set(chave, { contagem: 0, ultimaEm: new Date().toISOString() });
+  persistViolacoes.agendarSalvar();
+}
+
+// Fichas já expiradas não precisam ocupar espaço no arquivo. Roda uma vez no boot.
+function limparViolacoesExpiradas() {
+  let removidas = 0;
+  for (const chave of [...violationCounts.keys()]) {
+    const bruto = violationCounts.get(chave);
+    if (typeof bruto === 'number' || !bruto?.ultimaEm) continue;
+    if (Date.now() - new Date(bruto.ultimaEm).getTime() >= HORAS_RESET_VIOLACOES * 3600_000) {
+      violationCounts.delete(chave);
+      removidas++;
+    }
+  }
+  if (removidas > 0) {
+    persistViolacoes.agendarSalvar();
+    console.log(`${removidas} ficha(s) de violação expiradas foram limpas (janela de ${HORAS_RESET_VIOLACOES}h).`);
+  }
+}
+
 // Pessoas vistas mandando mensagem em algum grupo — alimenta a página /contatos.
 const persistContatos = criarMapaPersistente('contatos.json');
 const contatosVistos = persistContatos.mapa;
@@ -1296,6 +1348,7 @@ async function connectToWhatsApp() {
   ]);
   // Sem isso, dedup zera a cada restart e a mesma mensagem pode ser moderada duas vezes.
   for (const id of marcaDagua.get().idsProcessados || []) processedMessageIds.add(id);
+  limparViolacoesExpiradas();
 
   // Primeiro boot depois do deploy: o arquivo não existe e a marca vem 0. Com marca 0, TODA
   // mensagem das últimas 24h que chegar por sincronização entraria na janela de resgate — o bot
@@ -2824,9 +2877,10 @@ app.post('/registrar-violacao', checkAuth, async (req, res) => {
   }
 
   const chave = `${grupo_id}:${participant}`;
-  const contagem = (violationCounts.get(chave) || 0) + 1;
-  violationCounts.set(chave, contagem);
-  persistViolacoes.agendarSalvar();
+  const { contagem, expirou, contagemAnterior } = anotarViolacao(chave);
+  if (expirou) {
+    console.log(`Ficha de ${participant} zerada antes desta violação: ${contagemAnterior} anterior(es) expiraram após ${HORAS_RESET_VIOLACOES}h sem infração.`);
+  }
 
   const cache = buscarMensagemRecente(grupo_id, participant, req.body.message_id);
   const textoDaVez = req.body.texto || cache?.texto || '';
@@ -2837,8 +2891,7 @@ app.post('/registrar-violacao', checkAuth, async (req, res) => {
   if (contagem >= REMOVE_THRESHOLD) {
     try {
       await sock.groupParticipantsUpdate(grupo_id, [participant], 'remove');
-      violationCounts.set(chave, 0);
-      persistViolacoes.agendarSalvar();
+      zerarViolacoes(chave);
       removido = true;
       const motivo = regra ? ` Regra violada: ${regra}.` : '';
       await enviarComDigitando(grupo_id, `⚠️ ${remetente || participant} foi removido do grupo automaticamente após atingir ${REMOVE_THRESHOLD} violações.${motivo}`);
