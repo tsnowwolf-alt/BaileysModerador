@@ -420,7 +420,7 @@ const HORAS_RESGATE = Number(process.env.HORAS_RESGATE_MENSAGENS || 24);
 // regra, usa no texto do aviso e joga fora, e o texto da mensagem nunca sai do processarMensagem.
 // Regras do grupo, cadastradas aqui pra que o painel consiga traduzir "Regra 3" no texto da
 // regra. O n8n só devolve o número; sem esse cadastro, o número sozinho não diz nada a quem lê.
-const persistRegras = criarValorPersistente('regras.json', { regras: [], textoBruto: '' });
+const persistRegras = criarValorPersistente('regras.json', { regras: [], textoBruto: '', inicioNumeracao: 1 });
 
 const historicoModeracao = criarValorPersistente('historico-moderacao.json', { eventos: [] });
 const MAX_EVENTOS_HISTORICO = 400;
@@ -1704,6 +1704,83 @@ app.get('/qr', async (req, res) => {
   }
 });
 
+// --- Casca compartilhada das páginas do painel ---
+//
+// Antes cada rota carregava seu próprio <head>, sua própria paleta e sua própria tipografia:
+// três cópias do mesmo CSS. Mudar uma cor exigia mudar em três lugares e lembrar dos três.
+// Agora existe uma casca só, com o menu, e cada página entrega só o miolo.
+//
+// O CSS específico da página entra DEPOIS do base de propósito: onde os dois definirem a mesma
+// classe, o da página vence — é por isso que a migração não mexeu na aparência de nada.
+const MENU_PAINEL = [
+  { href: '/painel', rotulo: 'Mesa de Debate', icone: '🗳️' },
+  { href: '/contatos', rotulo: 'Contatos', icone: '👥' },
+  { href: '/banidos', rotulo: 'Banidos', icone: '🚫' }
+];
+
+function paginaHtml({ titulo, ativo, largura = 860, cssExtra = '', corpo, scriptExtra = '' }) {
+  const menu = MENU_PAINEL
+    .map((item) => `<a href="${item.href}" class="${ativo === item.href ? 'ativo' : ''}"><span aria-hidden="true">${item.icone}</span>${item.rotulo}</a>`)
+    .join('');
+
+  return `<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>${escapeHtml(titulo)}</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Fraunces:opsz,wght@9..144,600&family=IBM+Plex+Mono:wght@400;500&family=IBM+Plex+Sans:wght@400;500;600&display=swap" rel="stylesheet">
+  <style>
+    :root {
+      --tinta: #1B2340; --papel: #EEF0F4; --superficie: #FFFFFF;
+      --dourado: #C99A2E; --dourado-suave: #F3E6C6;
+      --vermelho: #B23A2E; --vermelho-suave: #F4DCD8;
+      --verde: #3F7859; --verde-suave: #DCEBE2;
+      --linha: #DADCE3; --apagado: #5B6178;
+    }
+    * { box-sizing: border-box; }
+    body { margin: 0; background: var(--papel); color: var(--tinta); font-family: 'IBM Plex Sans', -apple-system, sans-serif; -webkit-font-smoothing: antialiased; line-height: 1.5; }
+    .envelope { max-width: ${largura}px; margin: 0 auto; padding: 18px 20px 64px; }
+
+    .menu { display: flex; gap: 6px; overflow-x: auto; padding: 4px 0 14px; margin-bottom: 18px; border-bottom: 1px solid var(--linha); -webkit-overflow-scrolling: touch; scrollbar-width: none; }
+    .menu::-webkit-scrollbar { display: none; }
+    .menu a { display: inline-flex; align-items: center; gap: 7px; white-space: nowrap; font-size: 13.5px; font-weight: 500; text-decoration: none; color: var(--apagado); background: var(--superficie); border: 1px solid var(--linha); padding: 8px 15px; border-radius: 999px; transition: border-color .12s, color .12s; }
+    .menu a:hover { border-color: var(--tinta); color: var(--tinta); }
+    .menu a.ativo { background: var(--tinta); border-color: var(--tinta); color: #fff; }
+    .menu a span { font-size: 14px; }
+
+    .cabecalho h1 { font-family: 'Fraunces', Georgia, serif; font-size: 28px; font-weight: 600; letter-spacing: -0.01em; margin: 0 0 4px; }
+    .cabecalho p { margin: 0; color: var(--apagado); font-size: 14px; }
+
+    .botao { font: inherit; font-weight: 600; font-size: 14px; padding: 11px 20px; border-radius: 8px; border: none; background: var(--tinta); color: #fff; cursor: pointer; margin-top: 12px; }
+    .botao:hover { background: #10182E; }
+    .botao-secundario { font: inherit; font-weight: 600; font-size: 12.5px; padding: 7px 12px; border-radius: 8px; border: 1px solid var(--vermelho); background: transparent; color: var(--vermelho); cursor: pointer; white-space: nowrap; }
+    .botao-secundario:hover { background: var(--vermelho-suave); }
+    .copiavel { background: var(--papel); padding: 2px 7px; border-radius: 5px; font-family: 'IBM Plex Mono', monospace; font-size: 11.5px; cursor: pointer; display: inline-block; word-break: break-all; }
+    .aviso-sucesso { background: var(--verde-suave); border: 1px solid var(--verde); color: #1F4A34; padding: 12px 16px; border-radius: 10px; margin-top: 16px; font-size: 14px; }
+${cssExtra}
+  </style>
+</head>
+<body>
+  <div class="envelope">
+    <nav class="menu">${menu}</nav>
+${corpo}
+  </div>
+  <script>
+    // Copiar via delegação: o identificador vem de fora e, interpolado numa string JS dentro de
+    // um atributo onclick, conseguia escapar dela.
+    document.addEventListener('click', (ev) => {
+      const alvo = ev.target.closest('[data-copiar]');
+      if (alvo) navigator.clipboard.writeText(alvo.dataset.copiar);
+    });
+  </script>
+${scriptExtra}
+</body>
+</html>`;
+}
+
 app.get('/contatos', (req, res) => {
   const contatos = [...contatosVistos.entries()].sort((a, b) => new Date(b[1].ultimaVez) - new Date(a[1].ultimaVez));
 
@@ -1791,71 +1868,44 @@ app.get('/contatos', (req, res) => {
     ? `<div class="aviso-sucesso">🔗 Se essa pessoa não estiver mais no grupo, manda esse link pra ela entrar de novo: <code class="copiavel" onclick="navigator.clipboard.writeText('${escapeHtml(req.query.link)}')">${escapeHtml(req.query.link)}</code></div>`
     : '';
 
-  res.send(`
-    <!doctype html>
-    <html lang="pt-BR">
-      <head>
-        <meta charset="utf-8">
-        <meta name="viewport" content="width=device-width, initial-scale=1">
-        <title>Pessoas vistas nos grupos</title>
-        <link rel="preconnect" href="https://fonts.googleapis.com">
-        <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-        <link href="https://fonts.googleapis.com/css2?family=Fraunces:opsz,wght@9..144,500;9..144,600;9..144,700&family=IBM+Plex+Sans:wght@400;500;600&family=IBM+Plex+Mono:wght@400;500&display=swap" rel="stylesheet">
-        <style>
-          :root {
-            --tinta: #1B2340; --papel: #EEF0F4; --superficie: #FFFFFF;
-            --dourado: #C99A2E; --dourado-suave: #F3E6C6;
-            --vermelho: #B23A2E; --vermelho-suave: #F4DCD8;
-            --verde: #3F7859; --verde-suave: #DCEBE2;
-            --linha: #DADCE3;
-          }
-          * { box-sizing: border-box; }
-          body { margin: 0; background: var(--papel); color: var(--tinta); font-family: 'IBM Plex Sans', -apple-system, sans-serif; -webkit-font-smoothing: antialiased; line-height: 1.5; }
-          .envelope { max-width: 900px; margin: 0 auto; padding: 32px 20px 64px; }
-          .cabecalho h1 { font-family: 'Fraunces', Georgia, serif; font-size: 28px; font-weight: 600; letter-spacing: -0.01em; margin: 0 0 4px; }
-          .cabecalho p { margin: 0; color: #5B6178; font-size: 14px; }
-          .aviso-sucesso { background: var(--verde-suave); border: 1px solid var(--verde); color: #1F4A34; padding: 12px 16px; border-radius: 10px; margin-top: 16px; font-size: 14px; }
-          .cartao { background: var(--superficie); border: 1px solid var(--linha); border-radius: 12px; padding: 22px; margin-top: 20px; }
-          .cartao__olho { font-family: 'IBM Plex Mono', monospace; font-size: 11px; letter-spacing: 0.08em; text-transform: uppercase; color: var(--dourado); font-weight: 500; margin: 0 0 4px; }
-          .cartao h2 { font-family: 'Fraunces', Georgia, serif; font-size: 20px; font-weight: 600; margin: 0 0 4px; }
-          .cartao__legenda { font-size: 13px; color: #5B6178; margin: 0 0 16px; }
-          input[type="text"], .campo input { font: inherit; font-size: 15px; padding: 10px 12px; border: 1px solid var(--linha); border-radius: 8px; background: var(--papel); color: var(--tinta); width: 100%; }
-          input:focus-visible { outline: 2px solid var(--dourado); outline-offset: 1px; background: var(--superficie); }
-          .botao { font: inherit; font-weight: 600; font-size: 14px; padding: 11px 20px; border-radius: 8px; border: none; background: var(--tinta); color: #fff; cursor: pointer; margin-top: 12px; }
-          .botao:hover { background: #10182E; }
-          .botao-secundario { font: inherit; font-weight: 600; font-size: 12.5px; padding: 7px 12px; border-radius: 8px; border: 1px solid var(--vermelho); background: transparent; color: var(--vermelho); cursor: pointer; white-space: nowrap; }
-          .botao-secundario:hover { background: #FBEAE7; }
-          .botao-mini { font-size: 15px; padding: 5px 9px; border-radius: 7px; border: 1px solid var(--linha); background: var(--papel); cursor: pointer; line-height: 1; }
-          .botao-mini--vermelho:hover { background: var(--vermelho-suave); border-color: var(--vermelho); }
-          .botao-mini--dourado:hover { background: var(--dourado-suave); border-color: var(--dourado); }
-          .form-inline { display: inline-block; margin-right: 6px; }
-          .selo { display: inline-block; font-size: 11.5px; font-weight: 600; padding: 4px 9px; border-radius: 999px; margin-right: 6px; white-space: nowrap; }
-          .selo--vermelho { background: var(--vermelho-suave); color: #7A2A20; }
-          .selo--dourado { background: var(--dourado-suave); color: #6B4E14; }
-          table { border-collapse: collapse; width: 100%; font-size: 13.5px; }
-          th { text-align: left; font-size: 11px; letter-spacing: 0.04em; text-transform: uppercase; color: #5B6178; padding: 8px 10px; border-bottom: 2px solid var(--linha); }
-          td { padding: 10px; border-bottom: 1px solid var(--linha); vertical-align: middle; }
-          tr:last-child td { border-bottom: none; }
-          .copiavel { background: var(--papel); padding: 2px 7px; border-radius: 5px; font-family: 'IBM Plex Mono', monospace; font-size: 12px; cursor: pointer; }
-          .celula-acoes { white-space: nowrap; }
-          .tabela-scroll { overflow-x: auto; }
-          .vazio { font-size: 14px; color: #5B6178; padding: 20px; text-align: center; border: 1px dashed var(--linha); border-radius: 10px; }
-          .lista-topicos { display: flex; flex-direction: column; gap: 10px; margin-bottom: 4px; }
-          .topico-linha { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 12px 14px; border: 1px solid var(--linha); border-radius: 10px; background: var(--papel); }
-          .topico-corpo { flex: 1; min-width: 0; }
-          .topico-tema { font-weight: 500; font-size: 14.5px; margin: 0 0 4px; }
-          .ticket__detalhe { font-family: 'IBM Plex Mono', monospace; font-size: 12px; color: #5B6178; }
-          .grade-add { display: flex; gap: 10px; align-items: flex-end; }
-          .grade-add .campo { flex: 1; }
-          .dica { font-size: 12.5px; color: #5B6178; margin: 0 0 16px; }
-        </style>
-      </head>
-      <body>
-        <div class="envelope">
+  res.send(paginaHtml({
+    titulo: 'Pessoas vistas nos grupos',
+    ativo: '/contatos',
+    largura: 900,
+    cssExtra: `
+    .cartao { background: var(--superficie); border: 1px solid var(--linha); border-radius: 12px; padding: 22px; margin-top: 20px; }
+    .cartao__olho { font-family: 'IBM Plex Mono', monospace; font-size: 11px; letter-spacing: 0.08em; text-transform: uppercase; color: var(--dourado); font-weight: 500; margin: 0 0 4px; }
+    .cartao h2 { font-family: 'Fraunces', Georgia, serif; font-size: 20px; font-weight: 600; margin: 0 0 4px; }
+    .cartao__legenda { font-size: 13px; color: #5B6178; margin: 0 0 16px; }
+    input[type="text"], .campo input { font: inherit; font-size: 15px; padding: 10px 12px; border: 1px solid var(--linha); border-radius: 8px; background: var(--papel); color: var(--tinta); width: 100%; }
+    input:focus-visible { outline: 2px solid var(--dourado); outline-offset: 1px; background: var(--superficie); }
+    .botao-mini { font-size: 15px; padding: 5px 9px; border-radius: 7px; border: 1px solid var(--linha); background: var(--papel); cursor: pointer; line-height: 1; }
+    .botao-mini--vermelho:hover { background: var(--vermelho-suave); border-color: var(--vermelho); }
+    .botao-mini--dourado:hover { background: var(--dourado-suave); border-color: var(--dourado); }
+    .form-inline { display: inline-block; margin-right: 6px; }
+    .selo { display: inline-block; font-size: 11.5px; font-weight: 600; padding: 4px 9px; border-radius: 999px; margin-right: 6px; white-space: nowrap; }
+    .selo--vermelho { background: var(--vermelho-suave); color: #7A2A20; }
+    .selo--dourado { background: var(--dourado-suave); color: #6B4E14; }
+    table { border-collapse: collapse; width: 100%; font-size: 13.5px; }
+    th { text-align: left; font-size: 11px; letter-spacing: 0.04em; text-transform: uppercase; color: #5B6178; padding: 8px 10px; border-bottom: 2px solid var(--linha); }
+    td { padding: 10px; border-bottom: 1px solid var(--linha); vertical-align: middle; }
+    tr:last-child td { border-bottom: none; }
+    .celula-acoes { white-space: nowrap; }
+    .tabela-scroll { overflow-x: auto; }
+    .vazio { font-size: 14px; color: #5B6178; padding: 20px; text-align: center; border: 1px dashed var(--linha); border-radius: 10px; }
+    .lista-topicos { display: flex; flex-direction: column; gap: 10px; margin-bottom: 4px; }
+    .topico-linha { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 12px 14px; border: 1px solid var(--linha); border-radius: 10px; background: var(--papel); }
+    .topico-corpo { flex: 1; min-width: 0; }
+    .topico-tema { font-weight: 500; font-size: 14.5px; margin: 0 0 4px; }
+    .ticket__detalhe { font-family: 'IBM Plex Mono', monospace; font-size: 12px; color: #5B6178; }
+    .grade-add { display: flex; gap: 10px; align-items: flex-end; }
+    .grade-add .campo { flex: 1; }
+    .dica { font-size: 12.5px; color: #5B6178; margin: 0 0 16px; }
+`,
+    corpo: `
           <header class="cabecalho">
             <h1>Pessoas vistas nos grupos</h1>
             <p>Clique no identificador pra copiar. A coluna "Número" só aparece quando o WhatsApp expõe (nem sempre disponível).</p>
-            <p style="margin-top:10px;"><a href="/banidos" style="font-size:13px;font-weight:500;text-decoration:none;color:var(--tinta);background:var(--superficie);border:1px solid var(--linha);padding:7px 13px;border-radius:999px;display:inline-block;">🚫 Banidos e histórico</a></p>
           </header>
 
           ${aviso}
@@ -1922,8 +1972,8 @@ app.get('/contatos', (req, res) => {
               <button class="botao" type="submit" style="margin-top:0; background: var(--verde);">Proteger</button>
             </form>
           </section>
-        </div>
-        <script>
+`,
+    scriptExtra: `<script>
           function filtrarContatos() {
             const termo = document.getElementById('busca').value.trim().toLowerCase();
             const linhas = document.querySelectorAll('#tabelaContatos tr[data-busca]');
@@ -1935,10 +1985,8 @@ app.get('/contatos', (req, res) => {
             });
             document.getElementById('semResultado').style.display = (termo && visiveis === 0) ? 'block' : 'none';
           }
-        </script>
-      </body>
-    </html>
-  `);
+        </script>`
+  }));
 });
 
 app.post('/contatos/banir', (req, res) => {
@@ -2083,79 +2131,54 @@ app.get('/painel', (req, res) => {
   };
   const infoFase = FASES[estado.fase] || FASES.normal;
 
-  res.send(`
-    <!doctype html>
-    <html lang="pt-BR">
-      <head>
-        <meta charset="utf-8">
-        <meta name="viewport" content="width=device-width, initial-scale=1">
-        <title>Mesa de Debate</title>
-        <link rel="preconnect" href="https://fonts.googleapis.com">
-        <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-        <link href="https://fonts.googleapis.com/css2?family=Fraunces:opsz,wght@9..144,500;9..144,600;9..144,700&family=IBM+Plex+Sans:wght@400;500;600&family=IBM+Plex+Mono:wght@400;500&display=swap" rel="stylesheet">
-        <style>
-          :root {
-            --tinta: #1B2340; --papel: #EEF0F4; --superficie: #FFFFFF;
-            --dourado: #C99A2E; --dourado-suave: #F3E6C6;
-            --vermelho: #B23A2E; --verde: #3F7859; --verde-suave: #DCEBE2;
-            --linha: #DADCE3;
-          }
-          * { box-sizing: border-box; }
-          body { margin: 0; background: var(--papel); color: var(--tinta); font-family: 'IBM Plex Sans', -apple-system, sans-serif; -webkit-font-smoothing: antialiased; line-height: 1.5; }
-          .envelope { max-width: 720px; margin: 0 auto; padding: 32px 20px 64px; }
-          .cabecalho h1 { font-family: 'Fraunces', Georgia, serif; font-size: 30px; font-weight: 600; letter-spacing: -0.01em; margin: 0 0 4px; }
-          .cabecalho p { margin: 0; color: #5B6178; font-size: 14px; }
-          .ticket { position: relative; margin-top: 20px; background: var(--superficie); border: 1px solid var(--linha); border-left: 5px solid var(--cor-fase, var(--verde)); border-radius: 10px; padding: 16px 18px; display: flex; flex-direction: column; gap: 4px; }
-          .ticket--normal { --cor-fase: var(--verde); }
-          .ticket--enquete { --cor-fase: var(--dourado); }
-          .ticket--debate { --cor-fase: var(--vermelho); }
-          .ticket__selo { position: absolute; top: -14px; right: 16px; width: 40px; height: 40px; border-radius: 50%; background: var(--superficie); border: 2px dashed var(--cor-fase, var(--verde)); display: flex; align-items: center; justify-content: center; font-size: 18px; transform: rotate(-8deg); }
-          .ticket__rotulo { font-family: 'Fraunces', Georgia, serif; font-size: 19px; font-weight: 600; }
-          .ticket__detalhe { font-family: 'IBM Plex Mono', monospace; font-size: 12.5px; color: #5B6178; }
-          .aviso-sucesso { background: var(--verde-suave); border: 1px solid var(--verde); color: #1F4A34; padding: 12px 16px; border-radius: 10px; margin-top: 16px; font-size: 14px; }
-          .cartao { background: var(--superficie); border: 1px solid var(--linha); border-radius: 12px; padding: 22px; margin-top: 20px; }
-          .cartao__olho { font-family: 'IBM Plex Mono', monospace; font-size: 11px; letter-spacing: 0.08em; text-transform: uppercase; color: var(--dourado); font-weight: 500; margin: 0 0 4px; }
-          .cartao h2 { font-family: 'Fraunces', Georgia, serif; font-size: 20px; font-weight: 600; margin: 0 0 4px; }
-          .cartao__legenda { font-size: 13px; color: #5B6178; margin: 0 0 18px; }
-          .grade-campos { display: grid; grid-template-columns: repeat(auto-fit, minmax(210px, 1fr)); gap: 14px 16px; }
-          .campo { display: flex; flex-direction: column; gap: 6px; }
-          .campo--largo { grid-column: 1 / -1; }
-          .campo label { font-size: 13px; font-weight: 500; }
-          .campo input { font: inherit; font-size: 15px; padding: 10px 12px; border: 1px solid var(--linha); border-radius: 8px; background: var(--papel); color: var(--tinta); width: 100%; }
-          .campo input:focus-visible { outline: 2px solid var(--dourado); outline-offset: 1px; background: var(--superficie); }
-          .botao { font: inherit; font-weight: 600; font-size: 14px; padding: 11px 20px; border-radius: 8px; border: none; background: var(--tinta); color: #fff; cursor: pointer; margin-top: 18px; }
-          .botao:hover { background: #10182E; }
-          .botao:focus-visible { outline: 2px solid var(--dourado); outline-offset: 2px; }
-          .botao--dourado { background: var(--dourado); color: #2B2106; }
-          .botao--dourado:hover { background: #B48A28; }
-          .botao-secundario { font: inherit; font-weight: 600; font-size: 12.5px; padding: 7px 12px; border-radius: 8px; border: 1px solid var(--vermelho); background: transparent; color: var(--vermelho); cursor: pointer; margin-top: 12px; }
-          .botao-secundario:hover { background: #FBEAE7; }
-          .botao-secundario:focus-visible { outline: 2px solid var(--vermelho); outline-offset: 2px; }
-          .acoes-topicos { display: flex; flex-wrap: wrap; gap: 10px; margin-bottom: 16px; }
-          .acoes-topicos .botao-secundario { margin-top: 0; }
-          .lista-topicos { display: flex; flex-direction: column; gap: 10px; margin-bottom: 4px; }
-          .topico-linha { display: flex; align-items: flex-start; gap: 12px; padding: 12px 14px; border: 1px solid var(--linha); border-radius: 10px; background: var(--papel); }
-          .topico-linha--usado { opacity: 0.55; }
-          .topico-status { font-size: 18px; line-height: 1; margin-top: 2px; }
-          .checkbox-topico { font-size: 18px; line-height: 1; margin-top: 2px; background: none; border: none; padding: 4px; border-radius: 6px; cursor: pointer; }
-          .checkbox-topico:hover { background: var(--papel); }
-          .checkbox-topico:focus-visible { outline: 2px solid var(--dourado); outline-offset: 1px; }
-          .topico-corpo { flex: 1; min-width: 0; }
-          .topico-tema { font-weight: 500; font-size: 14.5px; margin: 0 0 6px; }
-          .topico-opcoes { display: flex; flex-wrap: wrap; gap: 6px; }
-          .chip { font-family: 'IBM Plex Mono', monospace; font-size: 12px; background: var(--dourado-suave); color: #6B4E14; padding: 3px 9px; border-radius: 999px; }
-          .vazio { font-size: 14px; color: #5B6178; padding: 20px; text-align: center; border: 1px dashed var(--linha); border-radius: 10px; }
-          .dica { font-size: 12.5px; color: #5B6178; margin: 0 0 16px; line-height: 1.5; }
-          .dica code { background: var(--papel); padding: 1px 5px; border-radius: 4px; font-size: 12px; }
-          input[type="file"] { font: inherit; font-size: 13.5px; }
-        </style>
-      </head>
-      <body>
-        <div class="envelope">
+  res.send(paginaHtml({
+    titulo: 'Mesa de Debate',
+    ativo: '/painel',
+    largura: 720,
+    cssExtra: `
+    .ticket { position: relative; margin-top: 20px; background: var(--superficie); border: 1px solid var(--linha); border-left: 5px solid var(--cor-fase, var(--verde)); border-radius: 10px; padding: 16px 18px; display: flex; flex-direction: column; gap: 4px; }
+    .ticket--normal { --cor-fase: var(--verde); }
+    .ticket--enquete { --cor-fase: var(--dourado); }
+    .ticket--debate { --cor-fase: var(--vermelho); }
+    .ticket__selo { position: absolute; top: -14px; right: 16px; width: 40px; height: 40px; border-radius: 50%; background: var(--superficie); border: 2px dashed var(--cor-fase, var(--verde)); display: flex; align-items: center; justify-content: center; font-size: 18px; transform: rotate(-8deg); }
+    .ticket__rotulo { font-family: 'Fraunces', Georgia, serif; font-size: 19px; font-weight: 600; }
+    .ticket__detalhe { font-family: 'IBM Plex Mono', monospace; font-size: 12.5px; color: #5B6178; }
+    .cartao { background: var(--superficie); border: 1px solid var(--linha); border-radius: 12px; padding: 22px; margin-top: 20px; }
+    .cartao__olho { font-family: 'IBM Plex Mono', monospace; font-size: 11px; letter-spacing: 0.08em; text-transform: uppercase; color: var(--dourado); font-weight: 500; margin: 0 0 4px; }
+    .cartao h2 { font-family: 'Fraunces', Georgia, serif; font-size: 20px; font-weight: 600; margin: 0 0 4px; }
+    .cartao__legenda { font-size: 13px; color: #5B6178; margin: 0 0 18px; }
+    .grade-campos { display: grid; grid-template-columns: repeat(auto-fit, minmax(210px, 1fr)); gap: 14px 16px; }
+    .campo { display: flex; flex-direction: column; gap: 6px; }
+    .campo--largo { grid-column: 1 / -1; }
+    .campo label { font-size: 13px; font-weight: 500; }
+    .campo input { font: inherit; font-size: 15px; padding: 10px 12px; border: 1px solid var(--linha); border-radius: 8px; background: var(--papel); color: var(--tinta); width: 100%; }
+    .campo input:focus-visible { outline: 2px solid var(--dourado); outline-offset: 1px; background: var(--superficie); }
+    .botao:focus-visible { outline: 2px solid var(--dourado); outline-offset: 2px; }
+    .botao--dourado { background: var(--dourado); color: #2B2106; }
+    .botao--dourado:hover { background: #B48A28; }
+    .botao-secundario:focus-visible { outline: 2px solid var(--vermelho); outline-offset: 2px; }
+    .acoes-topicos { display: flex; flex-wrap: wrap; gap: 10px; margin-bottom: 16px; }
+    .acoes-topicos .botao-secundario { margin-top: 0; }
+    .lista-topicos { display: flex; flex-direction: column; gap: 10px; margin-bottom: 4px; }
+    .topico-linha { display: flex; align-items: flex-start; gap: 12px; padding: 12px 14px; border: 1px solid var(--linha); border-radius: 10px; background: var(--papel); }
+    .topico-linha--usado { opacity: 0.55; }
+    .topico-status { font-size: 18px; line-height: 1; margin-top: 2px; }
+    .checkbox-topico { font-size: 18px; line-height: 1; margin-top: 2px; background: none; border: none; padding: 4px; border-radius: 6px; cursor: pointer; }
+    .checkbox-topico:hover { background: var(--papel); }
+    .checkbox-topico:focus-visible { outline: 2px solid var(--dourado); outline-offset: 1px; }
+    .topico-corpo { flex: 1; min-width: 0; }
+    .topico-tema { font-weight: 500; font-size: 14.5px; margin: 0 0 6px; }
+    .topico-opcoes { display: flex; flex-wrap: wrap; gap: 6px; }
+    .chip { font-family: 'IBM Plex Mono', monospace; font-size: 12px; background: var(--dourado-suave); color: #6B4E14; padding: 3px 9px; border-radius: 999px; }
+    .vazio { font-size: 14px; color: #5B6178; padding: 20px; text-align: center; border: 1px dashed var(--linha); border-radius: 10px; }
+    .dica { font-size: 12.5px; color: #5B6178; margin: 0 0 16px; line-height: 1.5; }
+    .dica code { background: var(--papel); padding: 1px 5px; border-radius: 4px; font-size: 12px; }
+    input[type="file"] { font: inherit; font-size: 13.5px; }
+`,
+    corpo: `
           <header class="cabecalho">
             <h1>Mesa de Debate</h1>
             <p>Enquete e debate diário do grupo</p>
-            <p style="margin-top:10px;"><a href="/banidos" style="font-size:13px;font-weight:500;text-decoration:none;color:var(--tinta);background:var(--superficie);border:1px solid var(--linha);padding:7px 13px;border-radius:999px;display:inline-block;">🚫 Banidos e histórico</a></p>
           </header>
 
           <div class="ticket ${infoFase.classe}">
@@ -2268,8 +2291,8 @@ app.get('/painel', (req, res) => {
               <button class="botao botao--dourado" type="submit">Importar tópicos</button>
             </form>
           </section>
-        </div>
-        <script>
+`,
+    scriptExtra: `<script>
           function prepararImportacao(ev) {
             ev.preventDefault();
             const input = document.getElementById('arquivoTopicos');
@@ -2287,27 +2310,43 @@ app.get('/painel', (req, res) => {
             leitor.readAsText(arquivo);
             return false;
           }
-        </script>
-      </body>
-    </html>
-  `);
+        </script>`
+  }));
 });
 
 // Aceita os formatos que as pessoas realmente escrevem:
 //   1. Não divulgue produtos        3 - Respeite todos          Regra 5: proibido spam
-// Linha sem número é continuação da regra anterior, então regra de vários parágrafos funciona.
-function interpretarRegras(textoBruto) {
+//
+// Regra de ouro: UMA LINHA = UMA REGRA. Linha sem número é numerada automaticamente, continuando
+// de onde a anterior parou — é isso que permite começar em 10 quando as regras 1 a 9 já existem
+// em outro lugar. Número explícito sempre manda, e a sequência segue a partir dele.
+//
+// A exceção é a linha INDENTADA (começa com espaço): essa é continuação da regra anterior, pra
+// que regra de vários parágrafos continue possível. Escolhi indentação em vez de "linha grudada"
+// porque colar uma lista de regras sem número, uma por linha, é o caso comum — e ali cada linha
+// precisa virar uma regra separada.
+function interpretarRegras(textoBruto, inicioNumeracao = 1) {
   const regras = [];
+  let proximo = Math.max(1, Number(inicioNumeracao) || 1);
+
   for (const linha of String(textoBruto || '').split('\n')) {
     const limpa = linha.trim();
     if (!limpa) continue;
+
+    const indentada = /^[ \t]/.test(linha);
+    if (indentada && regras.length > 0) {
+      regras[regras.length - 1].texto += ` ${limpa}`;
+      continue;
+    }
+
     const casa = limpa.match(/^(?:regra\s*)?(\d{1,3})\s*[).:\-–]?\s+(.*)$/i);
     if (casa && casa[2]) {
-      regras.push({ numero: Number(casa[1]), texto: casa[2].trim() });
-    } else if (regras.length > 0) {
-      regras[regras.length - 1].texto += ` ${limpa}`;
+      const numero = Number(casa[1]);
+      regras.push({ numero, texto: casa[2].trim() });
+      proximo = numero + 1;
     } else {
-      regras.push({ numero: regras.length + 1, texto: limpa });
+      regras.push({ numero: proximo, texto: limpa });
+      proximo++;
     }
   }
   return regras;
@@ -2443,63 +2482,34 @@ app.get('/banidos', (req, res) => {
     .map(([chave, nome, n]) => `<a class="aba ${filtroAcao === chave ? 'aba--ativa' : ''}" href="/banidos${chave ? `?acao=${chave}` : ''}">${nome} <span>${n}</span></a>`)
     .join('');
 
-  res.send(`<!DOCTYPE html>
-<html lang="pt-BR">
-<head>
-  <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Banidos e histórico</title>
-  <link rel="preconnect" href="https://fonts.googleapis.com">
-  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-  <link href="https://fonts.googleapis.com/css2?family=Fraunces:opsz,wght@9..144,600&family=IBM+Plex+Mono:wght@400;500&family=IBM+Plex+Sans:wght@400;500;600&display=swap" rel="stylesheet">
-  <style>
-    :root {
-      --tinta: #1B2340; --papel: #EEF0F4; --superficie: #FFFFFF;
-      --dourado: #C99A2E; --dourado-suave: #F3E6C6;
-      --vermelho: #B23A2E; --vermelho-suave: #F4DCD8;
-      --verde: #3F7859; --verde-suave: #DCEBE2;
-      --linha: #DADCE3; --apagado: #5B6178;
-    }
-    * { box-sizing: border-box; }
-    body { margin: 0; background: var(--papel); color: var(--tinta); font-family: 'IBM Plex Sans', -apple-system, sans-serif; -webkit-font-smoothing: antialiased; line-height: 1.5; }
-    .envelope { max-width: 780px; margin: 0 auto; padding: 28px 18px 64px; }
-
-    .cabecalho h1 { font-family: 'Fraunces', Georgia, serif; font-size: 28px; font-weight: 600; letter-spacing: -0.01em; margin: 0 0 4px; }
-    .cabecalho p { margin: 0; color: var(--apagado); font-size: 14px; }
-    .navegacao { display: flex; gap: 8px; margin: 16px 0 0; flex-wrap: wrap; }
-    .navegacao a { font-size: 13px; font-weight: 500; text-decoration: none; color: var(--tinta); background: var(--superficie); border: 1px solid var(--linha); padding: 7px 13px; border-radius: 999px; }
-    .navegacao a:hover { border-color: var(--tinta); }
-
+  res.send(paginaHtml({
+    titulo: 'Banidos e histórico',
+    ativo: '/banidos',
+    largura: 780,
+    cssExtra: `
     .busca { margin-top: 20px; position: relative; }
     .busca input { font: inherit; font-size: 15px; width: 100%; padding: 12px 14px 12px 40px; border: 1px solid var(--linha); border-radius: 10px; background: var(--superficie); color: var(--tinta); }
     .busca input:focus-visible { outline: 2px solid var(--dourado); outline-offset: 1px; }
     .busca::before { content: '🔎'; position: absolute; left: 13px; top: 50%; transform: translateY(-50%); font-size: 15px; opacity: 0.55; }
-
     .secao { margin-top: 34px; }
     .secao__olho { font-family: 'IBM Plex Mono', monospace; font-size: 11px; letter-spacing: 0.08em; text-transform: uppercase; color: var(--dourado); font-weight: 500; margin: 0 0 4px; }
     .secao h2 { font-family: 'Fraunces', Georgia, serif; font-size: 21px; font-weight: 600; margin: 0 0 14px; }
-
     .pessoa { background: var(--superficie); border: 1px solid var(--linha); border-left: 5px solid var(--vermelho); border-radius: 12px; padding: 16px 18px; margin-bottom: 12px; }
     .pessoa__topo { display: flex; align-items: flex-start; justify-content: space-between; gap: 12px; }
     .pessoa__nome { font-family: 'Fraunces', Georgia, serif; font-size: 17px; font-weight: 600; margin: 0 0 2px; }
     .pessoa__numero { display: block; font-size: 13px; color: var(--apagado); margin-bottom: 4px; }
     .pessoa__motivo { margin-top: 12px; padding-top: 12px; border-top: 1px dashed var(--linha); }
     .pessoa__rodape { margin-top: 10px; font-family: 'IBM Plex Mono', monospace; font-size: 11.5px; color: var(--apagado); }
-
     .rotulo-linha { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin-bottom: 7px; }
     .rotulo { font-family: 'IBM Plex Mono', monospace; font-size: 10.5px; letter-spacing: 0.07em; text-transform: uppercase; color: var(--apagado); }
-
     .selo-regra { display: inline-block; background: var(--vermelho-suave); color: #7A2A20; font-size: 12px; font-weight: 600; padding: 3px 10px; border-radius: 999px; }
     .selo-regra--texto { background: var(--dourado-suave); color: #6B4E14; font-weight: 500; }
     .selo-regra--vazio { background: var(--papel); color: var(--apagado); font-weight: 400; }
-
     .citacao { margin: 0; background: var(--papel); border-radius: 8px; padding: 11px 13px; font-size: 14.5px; white-space: pre-wrap; word-break: break-word; border-left: 3px solid var(--linha); }
     .citacao--vazia { color: var(--apagado); font-style: italic; font-size: 13.5px; }
-
     .regra-texto { margin: 0 0 6px; font-size: 14px; color: var(--tinta); display: flex; gap: 9px; align-items: baseline; background: var(--vermelho-suave); border-radius: 8px; padding: 9px 12px; }
     .regra-texto--faltando { background: var(--papel); color: var(--apagado); font-style: italic; font-size: 13px; }
     .regra-texto__num { font-family: 'IBM Plex Mono', monospace; font-size: 11px; font-weight: 600; opacity: 0.6; flex-shrink: 0; }
-
     .editor { background: var(--superficie); border: 1px solid var(--linha); border-radius: 12px; margin-top: 20px; overflow: hidden; }
     .editor summary { cursor: pointer; padding: 14px 18px; font-weight: 600; font-size: 14.5px; list-style: none; display: flex; justify-content: space-between; align-items: center; gap: 10px; }
     .editor summary::-webkit-details-marker { display: none; }
@@ -2510,16 +2520,16 @@ app.get('/banidos', (req, res) => {
     .editor__dica { margin: 0 0 10px; font-size: 13px; color: var(--apagado); }
     .editor textarea { font: inherit; font-size: 14px; font-family: 'IBM Plex Mono', monospace; width: 100%; min-height: 190px; padding: 12px 14px; border: 1px solid var(--linha); border-radius: 9px; background: var(--papel); color: var(--tinta); resize: vertical; line-height: 1.6; }
     .editor textarea:focus-visible { outline: 2px solid var(--dourado); outline-offset: 1px; background: var(--superficie); }
-    .botao { font: inherit; font-weight: 600; font-size: 14px; padding: 11px 20px; border-radius: 8px; border: none; background: var(--tinta); color: #fff; cursor: pointer; margin-top: 12px; }
-    .botao:hover { background: #10182E; }
+    .campo-inicio { display: flex; align-items: center; gap: 9px; flex-wrap: wrap; font-size: 13.5px; font-weight: 500; margin-bottom: 12px; }
+    .campo-inicio input { font: inherit; font-family: 'IBM Plex Mono', monospace; width: 78px; padding: 8px 10px; border: 1px solid var(--linha); border-radius: 8px; background: var(--papel); color: var(--tinta); }
+    .campo-inicio input:focus-visible { outline: 2px solid var(--dourado); outline-offset: 1px; background: var(--superficie); }
+    .campo-inicio span { font-weight: 400; font-size: 12.5px; color: var(--apagado); flex-basis: 100%; }
+    .editor__resultado { margin: 14px 0 0; font-size: 13px; color: var(--apagado); display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }
     .contador-regras { font-family: 'IBM Plex Mono', monospace; font-size: 11px; font-weight: 500; color: var(--apagado); }
-    .aviso-sucesso { background: var(--verde-suave); border: 1px solid var(--verde); color: #1F4A34; padding: 12px 16px; border-radius: 10px; margin-top: 16px; font-size: 14px; }
-
     .abas { display: flex; gap: 6px; flex-wrap: wrap; margin-bottom: 14px; }
     .aba { font-size: 13px; text-decoration: none; color: var(--apagado); background: var(--superficie); border: 1px solid var(--linha); padding: 6px 12px; border-radius: 999px; }
     .aba span { font-family: 'IBM Plex Mono', monospace; font-size: 11px; opacity: 0.7; }
     .aba--ativa { background: var(--tinta); color: #fff; border-color: var(--tinta); }
-
     .evento { background: var(--superficie); border: 1px solid var(--linha); border-left: 4px solid var(--linha); border-radius: 10px; padding: 13px 15px; margin-bottom: 10px; }
     .evento--vermelho { border-left-color: var(--vermelho); }
     .evento--dourado { border-left-color: var(--dourado); }
@@ -2533,29 +2543,15 @@ app.get('/banidos', (req, res) => {
     .selo-acao--verde { background: var(--verde-suave); color: #1F4A34; }
     .selo-acao--neutro { background: var(--papel); color: var(--apagado); }
     .pilula { font-family: 'IBM Plex Mono', monospace; font-size: 11px; background: var(--papel); color: var(--apagado); padding: 3px 8px; border-radius: 999px; }
-
-    .copiavel { background: var(--papel); padding: 2px 7px; border-radius: 5px; font-family: 'IBM Plex Mono', monospace; font-size: 11.5px; cursor: pointer; display: inline-block; word-break: break-all; }
-    .botao-secundario { font: inherit; font-weight: 600; font-size: 12.5px; padding: 7px 12px; border-radius: 8px; border: 1px solid var(--vermelho); background: transparent; color: var(--vermelho); cursor: pointer; white-space: nowrap; }
-    .botao-secundario:hover { background: var(--vermelho-suave); }
-
     .vazio { background: var(--superficie); border: 1px dashed var(--linha); border-radius: 12px; padding: 28px 20px; text-align: center; color: var(--apagado); font-size: 14px; }
     .vazio strong { display: block; font-family: 'Fraunces', Georgia, serif; font-size: 16px; color: var(--tinta); margin-bottom: 4px; }
-
-    @media (max-width: 520px) {
-      .pessoa__topo { flex-direction: column; }
-      .evento__quando { margin-left: 0; width: 100%; }
-    }
-  </style>
-</head>
-<body>
-  <div class="envelope">
+    .pessoa__topo { flex-direction: column; }
+    .evento__quando { margin-left: 0; width: 100%; }
+`,
+    corpo: `
     <header class="cabecalho">
       <h1>Banidos e histórico</h1>
       <p>Quem está banido, o que a pessoa escreveu e qual regra foi apontada.</p>
-      <nav class="navegacao">
-        <a href="/painel">← Painel</a>
-        <a href="/contatos">Contatos</a>
-      </nav>
     </header>
 
     ${req.query.salvo ? `<div class="aviso-sucesso">✅ ${regrasCadastradas.length} regra(s) salva(s). O texto agora aparece junto de cada banimento.</div>` : ''}
@@ -2563,11 +2559,17 @@ app.get('/banidos', (req, res) => {
     <details class="editor" ${regrasCadastradas.length === 0 ? 'open' : ''}>
       <summary>Regras do grupo <span class="contador-regras">${regrasCadastradas.length} cadastrada(s)</span></summary>
       <div class="editor__corpo">
-        <p class="editor__dica">Uma regra por linha, começando pelo número. O painel usa isso pra mostrar o texto da regra ao lado de cada punição. Aceita <code>1.</code>, <code>2 -</code> ou <code>Regra 3:</code>.</p>
+        <p class="editor__dica">Uma regra por linha. Se a linha já vier numerada (<code>1.</code>, <code>2 -</code>, <code>Regra 3:</code>) esse número vale; se vier sem número, ele é atribuído automaticamente a partir do valor abaixo. Uma linha = uma regra. Para continuar a regra anterior num segundo parágrafo, comece a linha com um espaço.</p>
         <form method="POST" action="/banidos/regras">
-          <textarea name="regras" placeholder="1. Não é permitido divulgar produtos, serviços ou links sem autorização do admin.&#10;2. Respeite todos os participantes: sem ofensas, discriminação ou assédio.&#10;3. Proibido conteúdo sexual, violento ou perturbador.">${escapeHtml(persistRegras.get().textoBruto || '')}</textarea>
+          <label class="campo-inicio">
+            Numerar a partir de
+            <input type="number" name="inicio" min="1" max="999" value="${Number(persistRegras.get().inicioNumeracao) || 1}">
+            <span>Use 10 se as regras 1 a 9 já existem no n8n.</span>
+          </label>
+          <textarea name="regras" placeholder="Não é permitido divulgar produtos, serviços ou links sem autorização do admin.&#10;Respeite todos os participantes: sem ofensas, discriminação ou assédio.&#10;Proibido conteúdo sexual, violento ou perturbador.">${escapeHtml(persistRegras.get().textoBruto || '')}</textarea>
           <button class="botao" type="submit">Salvar regras</button>
         </form>
+        ${regrasCadastradas.length > 0 ? `<p class="editor__resultado">Interpretado como: ${regrasCadastradas.map((r) => `<span class="selo-regra">Regra ${r.numero}</span>`).join('')}</p>` : ''}
       </div>
     </details>
 
@@ -2587,16 +2589,8 @@ app.get('/banidos', (req, res) => {
       <div class="abas">${abas}</div>
       ${linhasHistorico || '<div class="vazio"><strong>Nada registrado ainda</strong>O histórico começa a partir da primeira ação de moderação depois desta atualização.</div>'}
     </section>
-  </div>
-
-  <script>
-    // Copiar via delegação, não via onclick inline: o identificador vem de fora e, interpolado
-    // dentro de uma string JS num atributo, conseguia escapar dela.
-    document.addEventListener('click', (ev) => {
-      const alvo = ev.target.closest('[data-copiar]');
-      if (alvo) navigator.clipboard.writeText(alvo.dataset.copiar);
-    });
-
+`,
+    scriptExtra: `<script>
     const campo = document.getElementById('campoBusca');
     campo.addEventListener('input', () => {
       const termo = campo.value.trim().toLowerCase();
@@ -2604,14 +2598,14 @@ app.get('/banidos', (req, res) => {
         item.style.display = !termo || item.dataset.busca.includes(termo) ? '' : 'none';
       }
     });
-  </script>
-</body>
-</html>`);
+  </script>`
+  }));
 });
 
 app.post('/banidos/regras', (req, res) => {
   const textoBruto = String(req.body.regras || '');
-  persistRegras.set({ textoBruto, regras: interpretarRegras(textoBruto) });
+  const inicioNumeracao = Math.min(999, Math.max(1, Number(req.body.inicio) || 1));
+  persistRegras.set({ textoBruto, inicioNumeracao, regras: interpretarRegras(textoBruto, inicioNumeracao) });
   res.redirect('/banidos?salvo=1');
 });
 
