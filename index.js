@@ -6,7 +6,7 @@ import pino from 'pino';
 import express from 'express';
 import { exec } from 'child_process';
 import { promisify } from 'util';
-import { writeFile, readFile, unlink, readdir } from 'fs/promises';
+import { writeFile, readFile, unlink, readdir, mkdir, copyFile } from 'fs/promises';
 import { tmpdir } from 'os';
 import path from 'path';
 import crypto from 'crypto';
@@ -197,7 +197,11 @@ const persistProtegidos = criarMapaPersistente('numeros-protegidos.json'); // nu
 // lista ainda estiver vazia — depois disso é 100% editável pelo /contatos, essa linha não repete.
 async function garantirProtegidosDoDono() {
   await persistProtegidos.carregar();
-  const identificadoresDono = ['5511986694787@s.whatsapp.net', '157728429347047@lid'];
+  const identificadoresDono = [
+    '5511986694787@s.whatsapp.net',   // dono, formato número
+    '157728429347047@lid',            // dono, formato @lid
+    '5547996763184@s.whatsapp.net'    // protegido adicional, pedido em 04/08/2026
+  ];
   let mudou = false;
   for (const id of identificadoresDono) {
     if (!persistProtegidos.mapa.has(id)) {
@@ -208,6 +212,54 @@ async function garantirProtegidosDoDono() {
   if (mudou) {
     persistProtegidos.agendarSalvar();
     console.log('Números protegidos: garantido que o dono está protegido nos dois formatos (número e @lid).');
+  }
+}
+
+// --- Múltiplas contas de WhatsApp ---
+//
+// O AUTH_FOLDER sempre guardou DUAS coisas no mesmo diretório: a sessão do Baileys (creds.json,
+// session-*, pre-key-*) e todos os dados do bot (contatos, banidos, regras, histórico). Duas
+// contas ali dentro se sobrescreveriam.
+//
+// A separação é assimétrica de propósito: os DADOS ficam exatamente onde estão — nada é movido,
+// nenhuma migração de arquivo, zero risco de perder banidos ou regras. Só as SESSÕES descem um
+// nível, para AUTH_FOLDER/sessoes/<conta>/. Cada conta tem a sua; os dados são compartilhados,
+// que é o que se quer: trocar o número do bot não pode zerar o histórico do grupo.
+const PASTA_SESSOES = path.join(AUTH_FOLDER, 'sessoes');
+const ARQUIVOS_DE_SESSAO = /^(creds\.json|app-state-sync-|session-|pre-key-|sender-key-)/;
+
+const configContas = criarValorPersistente('contas.json', {
+  ativa: 'principal',   // null = bot desligado, sem conectar em nenhuma conta
+  contas: { principal: { rotulo: 'Conta principal', criadaEm: null, ultimoJid: null } }
+});
+
+function pastaDaConta(nome) {
+  if (!nome || !/^[a-z0-9-]{1,30}$/i.test(nome)) return null;
+  return path.join(PASTA_SESSOES, nome);
+}
+
+// Leva a sessão que hoje está solta no AUTH_FOLDER para sessoes/principal/. Copia em vez de mover:
+// se algo der errado, os arquivos originais continuam lá e basta voltar a versão anterior do
+// código. Roda uma vez só — depois que o destino existe, não repete.
+async function migrarSessaoSolta() {
+  try {
+    await mkdir(PASTA_SESSOES, { recursive: true });
+    const destino = pastaDaConta('principal');
+    const jaMigrado = await readdir(destino).then((f) => f.includes('creds.json')).catch(() => false);
+    if (jaMigrado) return;
+
+    const naRaiz = await readdir(AUTH_FOLDER).catch(() => []);
+    const sessao = naRaiz.filter((n) => ARQUIVOS_DE_SESSAO.test(n));
+    if (sessao.length === 0) return;
+
+    await mkdir(destino, { recursive: true });
+    for (const nome of sessao) {
+      await copyFile(path.join(AUTH_FOLDER, nome), path.join(destino, nome)).catch((err) =>
+        console.error(`Falha ao copiar ${nome}:`, err.message));
+    }
+    console.log(`[CONTAS] Sessão existente copiada para sessoes/principal/ (${sessao.length} arquivo(s)). Os originais foram mantidos como backup.`);
+  } catch (err) {
+    console.error('[CONTAS] Erro ao migrar a sessão solta:', err.message);
   }
 }
 
@@ -586,7 +638,15 @@ function ultimoMotivoDe(identificador) {
 // dá vários seguidos com poucos segundos entre eles.
 const historicoBoots = criarValorPersistente('boots.json', { boots: [] });
 
+let bootJaRegistrado = false;
+
 async function registrarBoot() {
+  // connectToWhatsApp() roda de novo a cada reconexão. Sem essa trava, cada queda de rede virava
+  // um "boot" no boots.json e o contador — que existe justamente pra detectar crash-loop —
+  // acusaria crash-loop onde havia só reconexão.
+  if (bootJaRegistrado) return;
+  bootJaRegistrado = true;
+
   await historicoBoots.carregar();
   const anteriores = historicoBoots.get().boots || [];
   const agora = Date.now();
@@ -820,6 +880,7 @@ async function flushTudo() {
     marcaDagua.flush(),
     historicoModeracao.flush(),
     persistRegras.flush(),
+    configContas.flush(),
     persistBanidos.flush(),
     persistLiberados.flush(),
     persistProtegidos.flush()
@@ -850,6 +911,13 @@ for (const sinal of ['SIGTERM', 'SIGINT']) {
 }
 
 let sock;
+let contaConectada = null;    // qual conta o socket atual está usando
+// Cada tentativa de conexão recebe um número. Se a conta mudar, o número muda junto e tudo que
+// ficou agendado pela conexão anterior (reconexão em 5s, eventos de um socket morrendo) percebe
+// que está velho e se cala. Sem isso, uma queda de rede segundos antes de você trocar de conta
+// faria o timer antigo abrir um SEGUNDO socket depois da troca.
+let geracaoConexao = 0;
+let trocaEmAndamento = false; // suprime a reconexão automática durante troca ou desligamento
 let currentQR = null;
 let isConnected = false;
 let tickerDebateIniciado = false;
@@ -1142,7 +1210,10 @@ function resolverVotoAgora(idVoto) {
       votos[indice] = { ...votos[indice], opcaoResolvida: resultado.opcao };
       const patch = { votosAcumulados: votos };
       // Primeira combinação que funcionou vira a aposta principal dos próximos votos.
-      if (resultado.criador && !estado.pollCreatorConfirmado) {
+      // Compara com o valor guardado em vez de só preencher quando está vazio. Se a conta do bot
+      // mudar (número novo = @lid novo), o JID antigo continuaria eternamente como primeira aposta
+      // e nunca seria substituído, porque o campo já estava preenchido.
+      if (resultado.criador && resultado.criador !== estado.pollCreatorConfirmado) {
         patch.pollCreatorConfirmado = resultado.criador;
         console.log(`DIAGNÓSTICO ENQUETE: JID de criador que decripta confirmado = ${resultado.criador}`);
       }
@@ -1353,22 +1424,112 @@ async function verificarCicloDebate() {
 const ARQUIVOS_PROPRIOS_NO_AUTH_FOLDER = new Set([
   'contatos.json', 'violations.json', 'config-debate.json', 'estado-debate.json',
   'topicos-enquete.json', 'mensagens-enviadas.json', 'numeros-banidos.json', 'numeros-liberados.json',
-  'numeros-protegidos.json', 'marca-dagua-mensagens.json', 'boots.json', 'historico-moderacao.json', 'regras.json'
+  'numeros-protegidos.json', 'marca-dagua-mensagens.json', 'boots.json', 'historico-moderacao.json', 'regras.json', 'contas.json'
 ]);
 
-async function limparCredenciaisAntigasDoBaileys() {
+// Agora que sessão e dados moram em diretórios diferentes, a limpeza é trivial e segura: apaga
+// a pasta da conta e pronto. Antes ela varria o AUTH_FOLDER inteiro e dependia de uma lista de
+// exceções pra não levar os dados junto — foi assim que 'numeros-protegidos.json' quase sumiu.
+async function limparCredenciaisAntigasDoBaileys(nomeConta = null) {
+  const pasta = pastaDaConta(nomeConta || configContas.get().ativa);
+  if (!pasta) return;
   try {
-    const arquivos = await readdir(AUTH_FOLDER);
-    const paraApagar = arquivos.filter((nome) => !ARQUIVOS_PROPRIOS_NO_AUTH_FOLDER.has(nome));
-    await Promise.all(paraApagar.map((nome) => unlink(path.join(AUTH_FOLDER, nome)).catch(() => {})));
-    console.log(`Sessão antiga do Baileys limpa (${paraApagar.length} arquivo(s)) — dados do bot preservados. Gerando QR novo...`);
+    const arquivos = await readdir(pasta).catch(() => []);
+    await Promise.all(arquivos.map((nome) => unlink(path.join(pasta, nome)).catch(() => {})));
+    console.log(`Sessão limpa (${arquivos.length} arquivo(s)) — dados do bot intactos. Gerando QR novo...`);
   } catch (err) {
-    console.error('Erro ao limpar credenciais antigas do Baileys:', err.message);
+    console.error('Erro ao limpar credenciais do Baileys:', err.message);
+  }
+}
+
+// Guarda qual conta do WhatsApp o bot está usando. Trocar o número do bot gera um @lid novo, e
+// algumas coisas gravadas ficam presas na conta antiga — em especial o pollCreatorConfirmado, que
+// é a primeira aposta na hora de decriptar voto de enquete. Sem limpar, ele apontaria pra sempre
+// pro JID do bot velho.
+function detectarTrocaDeConta() {
+  try {
+    const atual = sock?.user?.id ? seguroNormalizar(sock.user.id) : null;
+    if (!atual) return;
+
+    if (contaConectada) {
+      const cfg = configContas.get();
+      const info = cfg.contas?.[contaConectada];
+      if (info) {
+        configContas.set({ contas: { ...cfg.contas, [contaConectada]: { ...info, ultimoJid: atual } } });
+      }
+    }
+
+    const anterior = marcaDagua.get().contaDoBot || null;
+    if (anterior === atual) return;
+
+    marcaDagua.set({ contaDoBot: atual });
+
+    if (!anterior) {
+      console.log(`Conta do bot registrada: ${atual}`);
+      return;
+    }
+
+    console.log(`🔄 Conta do bot mudou: ${anterior} -> ${atual}. Limpando o que estava preso na conta antiga.`);
+    const estado = estadoDebate.get();
+    if (estado.pollCreatorConfirmado) {
+      estadoDebate.set({ pollCreatorConfirmado: null });
+      console.log('   pollCreatorConfirmado zerado — será reaprendido no primeiro voto da próxima enquete.');
+    }
+    if (estado.fase === 'enquete') {
+      console.log('   ⚠️ Havia uma enquete aberta criada pela conta antiga: os votos dela não vão decriptar. Use "Resetar ciclo" no /painel.');
+    }
+    persistMensagensEnviadas.mapa.clear();
+    persistMensagensEnviadas.agendarSalvar();
+    console.log('   Cache de mensagens enviadas limpo (as mensagens antigas eram da outra conta).');
+  } catch (err) {
+    console.error('Erro ao verificar troca de conta do bot:', err.message);
+  }
+}
+
+// Troca a conta ativa (ou desliga, com nome = null) sem derrubar o processo. Fecha o socket
+// atual, grava a escolha e reconecta. O flag trocaEmAndamento impede que o handler de 'close'
+// dispare a reconexão automática no meio do caminho.
+// Reconexão agendada só vale se ninguém trocou de conta nesse meio-tempo.
+function reconectarSeAindaForAVez(geracao, atraso) {
+  setTimeout(() => {
+    if (geracao !== geracaoConexao) {
+      console.log('[CONTAS] Reconexão agendada cancelada: a conta ativa mudou nesse meio-tempo.');
+      return;
+    }
+    connectToWhatsApp().catch((err) => console.error('Erro ao reconectar:', err.message));
+  }, atraso);
+}
+
+async function trocarConta(nome) {
+  geracaoConexao++;   // invalida timers e handlers da conexão anterior
+  trocaEmAndamento = true;
+  try {
+    if (sock) {
+      try { sock.end(undefined); } catch { /* socket já morto */ }
+    }
+    sock = null;
+    isConnected = false;
+    currentQR = null;
+    contaConectada = null;
+
+    configContas.set({ ativa: nome });
+    await configContas.flush();
+
+    await new Promise((r) => setTimeout(r, 1200));  // deixa o socket antigo terminar de fechar
+  } finally {
+    trocaEmAndamento = false;
+  }
+
+  if (nome) {
+    connectToWhatsApp().catch((err) => console.error('[CONTAS] Erro ao conectar na conta nova:', err.message));
+  } else {
+    console.log('[CONTAS] Bot desligado — nenhuma conta ativa.');
   }
 }
 
 async function connectToWhatsApp() {
-  const { state, saveCreds } = await useMultiFileAuthState(AUTH_FOLDER);
+  await configContas.carregar();
+  await migrarSessaoSolta();
   await Promise.all([
     persistContatos.carregar(),
     persistViolacoes.carregar(),
@@ -1379,6 +1540,7 @@ async function connectToWhatsApp() {
     marcaDagua.carregar(),
     historicoModeracao.carregar(),
     persistRegras.carregar(),
+    configContas.carregar(),
     registrarBoot(),
     semearListaDoEnvSeVazia(persistBanidos, 'NUMEROS_BANIDOS', 'Números banidos'),
     semearListaDoEnvSeVazia(persistLiberados, 'NUMEROS_LIBERADOS_DIVULGACAO', 'Números liberados pra divulgação'),
@@ -1403,6 +1565,30 @@ async function connectToWhatsApp() {
   if (estadoDebate.get().fase === 'normal' && !estadoDebate.get().proximoDisparoEm) {
     atualizarProximoDisparo();
   }
+  // Nenhuma conta ativa = bot desligado. Carrega os dados mesmo assim, pra que o painel continue
+  // funcionando e você consiga religar por lá.
+  const nomeConta = configContas.get().ativa;
+  if (!nomeConta) {
+    sock = null;
+    isConnected = false;
+    currentQR = null;
+    contaConectada = null;
+    console.log('[CONTAS] Nenhuma conta ativa — o bot está desligado. Ligue em /contas.');
+    return;
+  }
+
+  const minhaGeracao = ++geracaoConexao;
+
+  const pasta = pastaDaConta(nomeConta);
+  if (!pasta) {
+    console.error(`[CONTAS] Nome de conta inválido: "${nomeConta}". Bot não vai conectar.`);
+    return;
+  }
+  await mkdir(pasta, { recursive: true });
+  const { state, saveCreds } = await useMultiFileAuthState(pasta);
+  contaConectada = nomeConta;
+  console.log(`[CONTAS] Conectando com a conta "${nomeConta}".`);
+
   const { version, isLatest } = await fetchLatestBaileysVersion();
   console.log(`Usando WhatsApp Web v${version.join('.')} (mais recente conhecida: ${isLatest})`);
 
@@ -1416,6 +1602,9 @@ async function connectToWhatsApp() {
   sock.ev.on('creds.update', saveCreds);
 
   sock.ev.on('connection.update', async (update) => {
+    // Evento de um socket de geração anterior: ignora, quem manda agora é outro.
+    if (minhaGeracao !== geracaoConexao) return;
+
     const { connection, lastDisconnect, qr } = update;
 
     if (qr) {
@@ -1426,22 +1615,29 @@ async function connectToWhatsApp() {
 
     if (connection === 'close') {
       isConnected = false;
+      // Fechamento provocado por troca de conta ou desligamento: não reconectar, senão o socket
+      // velho ressuscita e briga com o novo.
+      if (trocaEmAndamento) {
+        console.log('[CONTAS] Conexão encerrada de propósito (troca/desligamento).');
+        return;
+      }
       const statusCode = lastDisconnect?.error instanceof Boom
         ? lastDisconnect.error.output?.statusCode
         : undefined;
       const shouldReconnect = statusCode !== DisconnectReason.loggedOut;
       console.log('Conexão fechada:', lastDisconnect?.error?.message, '| Reconectando:', shouldReconnect);
       if (shouldReconnect) {
-        setTimeout(connectToWhatsApp, 5000);
+        reconectarSeAindaForAVez(minhaGeracao, 5000);
       } else {
         console.log(`Sessão desconectada (logout) — limpando credenciais antigas e reiniciando pra gerar um QR novo.`);
         await limparCredenciaisAntigasDoBaileys();
-        setTimeout(connectToWhatsApp, 3000);
+        reconectarSeAindaForAVez(minhaGeracao, 3000);
       }
     } else if (connection === 'open') {
       currentQR = null;
       isConnected = true;
       console.log('Conectado ao WhatsApp com sucesso.');
+      detectarTrocaDeConta();
       if (!tickerDebateIniciado) {
         tickerDebateIniciado = true;
         setInterval(() => verificarCicloDebate().catch((err) => console.error('Erro no verificarCicloDebate:', err.message)), 60_000);
@@ -1685,6 +1881,16 @@ function extrairTextoDeContainer(conteudo, tipoConteudo) {
     const remetente = msg.pushName || participant;
     const mensagensRecentes = contarMensagensRecentes(`${grupoId}:${participant}`);
     const vezesQueRepetiu = contarRepeticoes(`${grupoId}:${participant}`, texto);
+    // Protegido não é moderado, ponto final. Antes essa checagem existia só no /apagar e no
+    // /registrar-violacao — o /avisar não tinha como checar, porque o n8n manda só grupo_id e
+    // mensagem, sem dizer de quem é o aviso. Resultado: pessoa protegida levava aviso do bot.
+    // Barrar aqui, antes de encaminhar, fecha os três caminhos de uma vez e ainda economiza a
+    // chamada de IA.
+    if (await participantEstaNaLista(participant, persistProtegidos.mapa)) {
+      console.log(`[PROTEGIDO] Mensagem de ${remetente || participant} não foi enviada pra moderação.`);
+      return;
+    }
+
     const podeDivulgar = await participantEstaNaLista(participant, persistLiberados.mapa);
 
     const possivelNumero = msg.key.senderPn || msg.key.participantPn || null;
@@ -1835,7 +2041,8 @@ app.get('/qr', async (req, res) => {
 const MENU_PAINEL = [
   { href: '/painel', rotulo: 'Mesa de Debate', icone: '🗳️' },
   { href: '/contatos', rotulo: 'Contatos', icone: '👥' },
-  { href: '/banidos', rotulo: 'Banidos', icone: '🚫' }
+  { href: '/banidos', rotulo: 'Banidos', icone: '🚫' },
+  { href: '/contas', rotulo: 'Contas', icone: '📱' }
 ];
 
 function paginaHtml({ titulo, ativo, largura = 860, cssExtra = '', corpo, scriptExtra = '' }) {
@@ -2713,6 +2920,155 @@ app.get('/regras', (req, res) => {
   });
 });
 
+app.post('/contas/ativar', checkAuth, async (req, res) => {
+  const nome = String(req.body.conta || '').trim();
+  const contas = configContas.get().contas || {};
+  if (!contas[nome]) return res.redirect(`/contas?aviso=${encodeURIComponent('Conta não encontrada.')}`);
+  trocarConta(nome).catch((err) => console.error('[CONTAS] Erro ao ativar:', err.message));
+  res.redirect(`/contas?aviso=${encodeURIComponent(`Ativando "${contas[nome].rotulo || nome}". Recarregue em alguns segundos.`)}`);
+});
+
+app.post('/contas/desligar', checkAuth, async (req, res) => {
+  trocarConta(null).catch((err) => console.error('[CONTAS] Erro ao desligar:', err.message));
+  res.redirect(`/contas?aviso=${encodeURIComponent('Bot desligado. Ele não vai moderar nem enviar nada até você ativar uma conta.')}`);
+});
+
+app.post('/contas/adicionar', checkAuth, async (req, res) => {
+  const rotulo = String(req.body.rotulo || '').trim() || 'Nova conta';
+  const nome = String(req.body.nome || '').trim().toLowerCase().replace(/[^a-z0-9-]/g, '-').slice(0, 30);
+  if (!nome) return res.redirect(`/contas?aviso=${encodeURIComponent('Dê um apelido válido pra conta (letras e números).')}`);
+
+  const atual = configContas.get();
+  if (atual.contas?.[nome]) return res.redirect(`/contas?aviso=${encodeURIComponent('Já existe uma conta com esse apelido.')}`);
+
+  await mkdir(pastaDaConta(nome), { recursive: true });
+  configContas.set({ contas: { ...atual.contas, [nome]: { rotulo, criadaEm: new Date().toISOString(), ultimoJid: null } } });
+  res.redirect(`/contas?aviso=${encodeURIComponent(`Conta "${rotulo}" criada. Ative ela e escaneie o QR com o número novo.`)}`);
+});
+
+app.post('/contas/remover', checkAuth, async (req, res) => {
+  const nome = String(req.body.conta || '').trim();
+  const atual = configContas.get();
+  if (nome === atual.ativa) {
+    return res.redirect(`/contas?aviso=${encodeURIComponent('Essa conta está ativa. Desligue o bot ou ative outra antes de remover.')}`);
+  }
+  if (!atual.contas?.[nome]) return res.redirect('/contas');
+
+  await limparCredenciaisAntigasDoBaileys(nome);
+  const contas = { ...atual.contas };
+  delete contas[nome];
+  configContas.set({ contas });
+  res.redirect(`/contas?aviso=${encodeURIComponent('Conta removida e sessão apagada. Seus dados do grupo não foram tocados.')}`);
+});
+
+app.get('/contas', (req, res) => {
+  const cfg = configContas.get();
+  const contas = cfg.contas || {};
+  const aviso = req.query.aviso ? `<div class="aviso-sucesso">${escapeHtml(req.query.aviso)}</div>` : '';
+
+  const numeroDoBot = sock?.user?.id ? sock.user.id.split(':')[0].split('@')[0] : null;
+
+  const cartoes = Object.entries(contas).map(([nome, info]) => {
+    const ativa = cfg.ativa === nome;
+    const conectada = ativa && isConnected;
+    const estado = !ativa ? { txt: 'Parada', cls: 'neutro' }
+      : conectada ? { txt: 'Ativa e conectada', cls: 'verde' }
+      : { txt: 'Ativa, conectando…', cls: 'dourado' };
+
+    return `
+      <article class="conta ${ativa ? 'conta--ativa' : ''}">
+        <div class="conta__topo">
+          <div>
+            <h3>${escapeHtml(info.rotulo || nome)}</h3>
+            <code class="copiavel" data-copiar="${escapeHtml(nome)}">${escapeHtml(nome)}</code>
+            ${ativa && numeroDoBot ? `<span class="conta__num">+${escapeHtml(numeroDoBot)}</span>` : ''}
+          </div>
+          <span class="selo-acao selo-acao--${estado.cls}">${estado.txt}</span>
+        </div>
+        ${info.ultimoJid ? `<p class="conta__jid">Último login: <code>${escapeHtml(info.ultimoJid)}</code></p>` : ''}
+        <div class="conta__acoes">
+          ${!ativa ? `<form method="POST" action="/contas/ativar"><input type="hidden" name="conta" value="${escapeHtml(nome)}"><button class="botao" type="submit">Ativar esta</button></form>` : ''}
+          ${!ativa ? `<form method="POST" action="/contas/remover" onsubmit="return confirm('Remover a conta e apagar a sessão dela? Os dados do grupo não são afetados.')"><input type="hidden" name="conta" value="${escapeHtml(nome)}"><button class="botao-secundario" type="submit">Remover</button></form>` : ''}
+        </div>
+      </article>`;
+  }).join('');
+
+  const corpo = `
+    <header class="cabecalho">
+      <h1>Contas do bot</h1>
+      <p>Mantenha vários números pareados e escolha qual está no ar — sem deslogar nenhum aparelho.</p>
+    </header>
+    ${aviso}
+
+    <div class="chave-geral ${cfg.ativa ? 'chave-geral--ligado' : 'chave-geral--desligado'}">
+      <div>
+        <strong>${cfg.ativa ? 'Bot ligado' : 'Bot desligado'}</strong>
+        <span>${cfg.ativa ? `Moderando pela conta "${escapeHtml(contas[cfg.ativa]?.rotulo || cfg.ativa)}".` : 'Nenhuma conta ativa. Nada é moderado, nenhuma enquete é disparada.'}</span>
+      </div>
+      ${cfg.ativa
+        ? `<form method="POST" action="/contas/desligar" onsubmit="return confirm('Desligar o bot? Ele para de moderar e de disparar enquetes até você ativar uma conta.')"><button class="botao-secundario" type="submit">Desligar bot</button></form>`
+        : ''}
+    </div>
+
+    <section class="secao">
+      <p class="secao__olho">Números pareados</p>
+      <h2>Suas contas (${Object.keys(contas).length})</h2>
+      ${cartoes || '<div class="vazio"><strong>Nenhuma conta</strong>Adicione uma abaixo.</div>'}
+    </section>
+
+    <details class="editor">
+      <summary>Adicionar uma conta</summary>
+      <div class="editor__corpo">
+        <p class="editor__dica">Cada conta guarda a própria sessão. Depois de criar, clique em "Ativar esta" e escaneie o QR com o número novo. Seus dados do grupo (banidos, regras, histórico) são compartilhados entre todas.</p>
+        <form method="POST" action="/contas/adicionar">
+          <label class="campo">Apelido visível<input type="text" name="rotulo" placeholder="Ex: Número reserva" required></label>
+          <label class="campo">Identificador (só letras, números e hífen)<input type="text" name="nome" placeholder="reserva" required></label>
+          <button class="botao" type="submit">Criar conta</button>
+        </form>
+      </div>
+    </details>`;
+
+  res.send(paginaHtml({
+    titulo: 'Contas do bot',
+    ativo: '/contas',
+    largura: 720,
+    cssExtra: `
+    .chave-geral { display: flex; align-items: center; justify-content: space-between; gap: 14px; flex-wrap: wrap; background: var(--superficie); border: 1px solid var(--linha); border-left: 5px solid var(--linha); border-radius: 12px; padding: 16px 18px; margin-top: 18px; }
+    .chave-geral--ligado { border-left-color: var(--verde); }
+    .chave-geral--desligado { border-left-color: var(--vermelho); }
+    .chave-geral strong { display: block; font-family: 'Fraunces', Georgia, serif; font-size: 17px; margin-bottom: 2px; }
+    .chave-geral span { font-size: 13.5px; color: var(--apagado); }
+    .secao { margin-top: 30px; }
+    .secao__olho { font-family: 'IBM Plex Mono', monospace; font-size: 11px; letter-spacing: 0.08em; text-transform: uppercase; color: var(--dourado); font-weight: 500; margin: 0 0 4px; }
+    .secao h2 { font-family: 'Fraunces', Georgia, serif; font-size: 21px; font-weight: 600; margin: 0 0 14px; }
+    .conta { background: var(--superficie); border: 1px solid var(--linha); border-left: 5px solid var(--linha); border-radius: 12px; padding: 15px 17px; margin-bottom: 11px; }
+    .conta--ativa { border-left-color: var(--verde); }
+    .conta__topo { display: flex; align-items: flex-start; justify-content: space-between; gap: 12px; }
+    .conta__topo h3 { font-family: 'Fraunces', Georgia, serif; font-size: 16.5px; font-weight: 600; margin: 0 0 5px; }
+    .conta__num { display: inline-block; margin-left: 7px; font-size: 13px; color: var(--apagado); }
+    .conta__jid { margin: 9px 0 0; font-size: 12.5px; color: var(--apagado); }
+    .conta__acoes { display: flex; gap: 8px; flex-wrap: wrap; margin-top: 12px; }
+    .conta__acoes form { margin: 0; }
+    .conta__acoes .botao { margin-top: 0; padding: 8px 15px; font-size: 13px; }
+    .selo-acao { font-size: 12px; font-weight: 600; padding: 4px 11px; border-radius: 999px; white-space: nowrap; }
+    .selo-acao--verde { background: var(--verde-suave); color: #1F4A34; }
+    .selo-acao--dourado { background: var(--dourado-suave); color: #6B4E14; }
+    .selo-acao--neutro { background: var(--papel); color: var(--apagado); }
+    .editor { background: var(--superficie); border: 1px solid var(--linha); border-radius: 12px; margin-top: 22px; overflow: hidden; }
+    .editor summary { cursor: pointer; padding: 14px 18px; font-weight: 600; font-size: 14.5px; list-style: none; }
+    .editor summary::-webkit-details-marker { display: none; }
+    .editor[open] summary { border-bottom: 1px solid var(--linha); }
+    .editor__corpo { padding: 16px 18px 18px; }
+    .editor__dica { margin: 0 0 12px; font-size: 13px; color: var(--apagado); }
+    .campo { display: block; font-size: 13.5px; font-weight: 500; margin-bottom: 11px; }
+    .campo input { font: inherit; font-size: 14.5px; width: 100%; margin-top: 5px; padding: 10px 12px; border: 1px solid var(--linha); border-radius: 8px; background: var(--papel); color: var(--tinta); }
+    .campo input:focus-visible { outline: 2px solid var(--dourado); outline-offset: 1px; background: var(--superficie); }
+    .vazio { background: var(--superficie); border: 1px dashed var(--linha); border-radius: 12px; padding: 26px 20px; text-align: center; color: var(--apagado); font-size: 14px; }
+    .vazio strong { display: block; font-family: 'Fraunces', Georgia, serif; font-size: 16px; color: var(--tinta); margin-bottom: 4px; }`,
+    corpo
+  }));
+});
+
 app.post('/painel', (req, res) => {
   const { grupoId, intervaloDiasMencao, horario, horarioSemana, duracaoEnqueteHoras, duracaoDebateHoras, minVotosDebate } = req.body;
   configDebate.set({
@@ -2894,9 +3250,16 @@ app.post('/apagar', checkAuth, async (req, res) => {
 });
 
 app.post('/avisar', checkAuth, async (req, res) => {
-  const { grupo_id, mensagem } = req.body;
+  const { grupo_id, mensagem, participant } = req.body;
   if (!sock) return res.status(503).json({ erro: 'WhatsApp ainda não conectado' });
   if (!mensagem) return res.status(400).json({ erro: 'campo "mensagem" vazio' });
+
+  // Segunda barreira: se o n8n disser de quem é o aviso, respeita a lista de protegidos aqui
+  // também. Opcional de propósito — sem o campo, o comportamento continua igual ao de antes.
+  if (participant && await participantEstaNaLista(participant, persistProtegidos.mapa)) {
+    console.log(`[PROTEGIDO] Aviso para ${participant} bloqueado no /avisar.`);
+    return res.json({ ok: true, ignorado: 'participante protegido' });
+  }
 
   try {
     await enviarComDigitando(grupo_id, mensagem);
