@@ -71,6 +71,87 @@ async function extrairAudioDoVideo(bufferOriginal) {
 
 const N8N_WEBHOOK_URL = process.env.N8N_WEBHOOK_URL; // ex: https://SEU-N8N.up.railway.app/webhook/whatsapp-moderador
 const API_SECRET = process.env.API_SECRET;           // mesmo valor configurado no header x-api-secret do n8n
+
+// --- Senha do painel ---
+//
+// Fica em variável de ambiente, nunca no código: este arquivo vai pro GitHub, e senha em
+// repositório é senha vazada. Se PAINEL_SENHA não estiver configurada, o painel NÃO abre —
+// falha fechada de propósito. O contrário (abrir sem senha quando a variável falta) daria a
+// impressão de estar protegido enquanto estivesse escancarado.
+const PAINEL_SENHA = process.env.PAINEL_SENHA || '';
+const DIAS_SESSAO_PAINEL = Number(process.env.DIAS_SESSAO_PAINEL || 90);
+const COOKIE_SESSAO = 'painel_sessao';
+
+// Rotas que não exigem login: healthcheck do Railway e a própria tela de entrar.
+const ROTAS_PUBLICAS = new Set(['/health', '/login', '/logout']);
+
+function assinarSessao(dado) {
+  return crypto.createHmac('sha256', PAINEL_SENHA).update(String(dado)).digest('hex');
+}
+
+// Comparação em tempo constante: comparar string com === vaza, pelo tempo de resposta, quantos
+// caracteres iniciais estavam certos.
+function iguaisEmTempoConstante(a, b) {
+  const bufA = Buffer.from(String(a), 'utf8');
+  const bufB = Buffer.from(String(b), 'utf8');
+  if (bufA.length !== bufB.length) return false;
+  return crypto.timingSafeEqual(bufA, bufB);
+}
+
+// O cookie não guarda a senha — guarda um prazo de validade assinado com ela. Quem não sabe a
+// senha não consegue forjar a assinatura, e trocar a senha invalida todas as sessões de uma vez.
+function criarTokenSessao() {
+  const expiraEm = Date.now() + DIAS_SESSAO_PAINEL * 86400_000;
+  return `${expiraEm}.${assinarSessao(expiraEm)}`;
+}
+
+function tokenSessaoValido(token) {
+  if (!token || !PAINEL_SENHA) return false;
+  const [expiraEm, assinatura] = String(token).split('.');
+  if (!expiraEm || !assinatura) return false;
+  if (!iguaisEmTempoConstante(assinatura, assinarSessao(expiraEm))) return false;
+  return Number(expiraEm) > Date.now();
+}
+
+function lerCookie(req, nome) {
+  for (const parte of (req.headers.cookie || '').split(';')) {
+    const [chave, ...resto] = parte.trim().split('=');
+    if (chave === nome) return decodeURIComponent(resto.join('='));
+  }
+  return null;
+}
+
+// Aceita cookie do navegador OU o header do n8n — assim as integrações continuam funcionando
+// sem precisar de sessão.
+function estaAutenticado(req) {
+  if (API_SECRET && req.headers['x-api-secret'] === API_SECRET) return true;
+  return tokenSessaoValido(lerCookie(req, COOKIE_SESSAO));
+}
+
+// Trava simples contra força bruta: 10 tentativas erradas por IP a cada 15 min.
+const tentativasLogin = new Map();
+const JANELA_TENTATIVAS_MS = 15 * 60_000;
+const MAX_TENTATIVAS = 10;
+
+function podeTentarLogin(ip) {
+  const registro = tentativasLogin.get(ip);
+  if (!registro) return true;
+  if (Date.now() - registro.desde > JANELA_TENTATIVAS_MS) {
+    tentativasLogin.delete(ip);
+    return true;
+  }
+  return registro.erros < MAX_TENTATIVAS;
+}
+
+function registrarErroLogin(ip) {
+  const registro = tentativasLogin.get(ip);
+  if (!registro || Date.now() - registro.desde > JANELA_TENTATIVAS_MS) {
+    tentativasLogin.set(ip, { erros: 1, desde: Date.now() });
+  } else {
+    registro.erros++;
+  }
+  while (tentativasLogin.size > 500) tentativasLogin.delete(tentativasLogin.keys().next().value);
+}
 const AUTH_FOLDER = process.env.AUTH_FOLDER || 'auth_info_baileys';
 const PORT = process.env.PORT || 3000;
 
@@ -1982,6 +2063,23 @@ const app = express();
 app.use(express.json());
 app.use(express.urlencoded({ extended: true, limit: '5mb' }));
 
+// Porteiro de TODAS as rotas. Registrado aqui em cima de propósito: middleware vale só pro que
+// vem depois, então qualquer rota nova nasce protegida sem ninguém precisar lembrar disso.
+// A /qr era a mais perigosa estando aberta — quem carregasse aquela página podia escanear o QR
+// e vincular o próprio aparelho à conta do bot.
+app.use((req, res, next) => {
+  if (ROTAS_PUBLICAS.has(req.path)) return next();
+  if (estaAutenticado(req)) return next();
+
+  // Chamada de máquina (n8n, curl) recebe erro; navegador vai pra tela de login.
+  const querJson = req.headers.accept?.includes('application/json') || req.method !== 'GET';
+  if (querJson && !req.headers.accept?.includes('text/html')) {
+    return res.status(401).json({ erro: 'não autorizado' });
+  }
+  const destino = encodeURIComponent(req.originalUrl || '/painel');
+  res.redirect(`/login?de=${destino}`);
+});
+
 function escapeHtml(valor) {
   return String(valor ?? '').replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
 }
@@ -2077,6 +2175,9 @@ function paginaHtml({ titulo, ativo, largura = 860, cssExtra = '', corpo, script
     .menu a:hover { border-color: var(--tinta); color: var(--tinta); }
     .menu a.ativo { background: var(--tinta); border-color: var(--tinta); color: #fff; }
     .menu a span { font-size: 14px; }
+    .menu__sair { margin: 0 0 0 auto; padding-left: 8px; }
+    .menu__sair button { font: inherit; font-size: 13px; color: var(--apagado); background: none; border: none; cursor: pointer; padding: 8px 4px; white-space: nowrap; }
+    .menu__sair button:hover { color: var(--vermelho); text-decoration: underline; }
 
     .cabecalho h1 { font-family: 'Fraunces', Georgia, serif; font-size: 28px; font-weight: 600; letter-spacing: -0.01em; margin: 0 0 4px; }
     .cabecalho p { margin: 0; color: var(--apagado); font-size: 14px; }
@@ -2092,7 +2193,7 @@ ${cssExtra}
 </head>
 <body>
   <div class="envelope">
-    <nav class="menu">${menu}</nav>
+    <nav class="menu">${menu}<form method="POST" action="/logout" class="menu__sair"><button type="submit">Sair</button></form></nav>
 ${corpo}
   </div>
   <script>
@@ -2920,7 +3021,7 @@ app.get('/regras', (req, res) => {
   });
 });
 
-app.post('/contas/ativar', checkAuth, async (req, res) => {
+app.post('/contas/ativar', async (req, res) => {
   const nome = String(req.body.conta || '').trim();
   const contas = configContas.get().contas || {};
   if (!contas[nome]) return res.redirect(`/contas?aviso=${encodeURIComponent('Conta não encontrada.')}`);
@@ -2928,12 +3029,12 @@ app.post('/contas/ativar', checkAuth, async (req, res) => {
   res.redirect(`/contas?aviso=${encodeURIComponent(`Ativando "${contas[nome].rotulo || nome}". Recarregue em alguns segundos.`)}`);
 });
 
-app.post('/contas/desligar', checkAuth, async (req, res) => {
+app.post('/contas/desligar', async (req, res) => {
   trocarConta(null).catch((err) => console.error('[CONTAS] Erro ao desligar:', err.message));
   res.redirect(`/contas?aviso=${encodeURIComponent('Bot desligado. Ele não vai moderar nem enviar nada até você ativar uma conta.')}`);
 });
 
-app.post('/contas/adicionar', checkAuth, async (req, res) => {
+app.post('/contas/adicionar', async (req, res) => {
   const rotulo = String(req.body.rotulo || '').trim() || 'Nova conta';
   const nome = String(req.body.nome || '').trim().toLowerCase().replace(/[^a-z0-9-]/g, '-').slice(0, 30);
   if (!nome) return res.redirect(`/contas?aviso=${encodeURIComponent('Dê um apelido válido pra conta (letras e números).')}`);
@@ -2946,7 +3047,7 @@ app.post('/contas/adicionar', checkAuth, async (req, res) => {
   res.redirect(`/contas?aviso=${encodeURIComponent(`Conta "${rotulo}" criada. Ative ela e escaneie o QR com o número novo.`)}`);
 });
 
-app.post('/contas/remover', checkAuth, async (req, res) => {
+app.post('/contas/remover', async (req, res) => {
   const nome = String(req.body.conta || '').trim();
   const atual = configContas.get();
   if (nome === atual.ativa) {
@@ -2959,6 +3060,99 @@ app.post('/contas/remover', checkAuth, async (req, res) => {
   delete contas[nome];
   configContas.set({ contas });
   res.redirect(`/contas?aviso=${encodeURIComponent('Conta removida e sessão apagada. Seus dados do grupo não foram tocados.')}`);
+});
+
+app.get('/login', (req, res) => {
+  if (estaAutenticado(req)) return res.redirect('/painel');
+
+  const de = typeof req.query.de === 'string' ? req.query.de : '/painel';
+  const erro = req.query.erro;
+  const semSenhaConfigurada = !PAINEL_SENHA;
+
+  const avisos = {
+    invalida: 'Senha incorreta.',
+    bloqueado: 'Muitas tentativas. Espere 15 minutos e tente de novo.'
+  };
+  const aviso = erro && avisos[erro] ? `<p class="erro">${avisos[erro]}</p>` : '';
+
+  res.send(`<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Entrar</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Fraunces:opsz,wght@9..144,600&family=IBM+Plex+Sans:wght@400;500;600&display=swap" rel="stylesheet">
+  <style>
+    :root { --tinta:#1B2340; --papel:#EEF0F4; --superficie:#FFFFFF; --dourado:#C99A2E; --vermelho:#B23A2E; --vermelho-suave:#F4DCD8; --linha:#DADCE3; --apagado:#5B6178; }
+    * { box-sizing: border-box; }
+    body { margin:0; min-height:100vh; display:flex; align-items:center; justify-content:center; padding:24px;
+           background:var(--papel); color:var(--tinta); font-family:'IBM Plex Sans',-apple-system,sans-serif; line-height:1.5; }
+    .cartao { background:var(--superficie); border:1px solid var(--linha); border-radius:16px; padding:32px 28px; width:100%; max-width:380px; }
+    h1 { font-family:'Fraunces',Georgia,serif; font-size:26px; font-weight:600; margin:0 0 6px; letter-spacing:-0.01em; }
+    .sub { margin:0 0 22px; font-size:14px; color:var(--apagado); }
+    label { display:block; font-size:13.5px; font-weight:500; margin-bottom:6px; }
+    input { font:inherit; font-size:16px; width:100%; padding:12px 14px; border:1px solid var(--linha); border-radius:9px; background:var(--papel); color:var(--tinta); }
+    input:focus-visible { outline:2px solid var(--dourado); outline-offset:1px; background:var(--superficie); }
+    button { font:inherit; font-weight:600; font-size:15px; width:100%; margin-top:16px; padding:13px; border:none; border-radius:9px; background:var(--tinta); color:#fff; cursor:pointer; }
+    button:hover { background:#10182E; }
+    .erro { background:var(--vermelho-suave); color:#7A2A20; font-size:13.5px; padding:10px 13px; border-radius:8px; margin:0 0 16px; }
+    .nota { margin:18px 0 0; font-size:12.5px; color:var(--apagado); }
+    code { background:var(--papel); padding:2px 6px; border-radius:4px; font-size:12px; }
+  </style>
+</head>
+<body>
+  <div class="cartao">
+    <h1>Painel do bot</h1>
+    <p class="sub">Entre para continuar.</p>
+    ${aviso}
+    ${semSenhaConfigurada ? `
+      <p class="erro">A variável <code>PAINEL_SENHA</code> não está configurada no Railway. Sem ela o painel não abre — defina a variável e reinicie o serviço.</p>
+    ` : `
+      <form method="POST" action="/login">
+        <input type="hidden" name="de" value="${escapeHtml(de)}">
+        <label for="senha">Senha</label>
+        <input id="senha" name="senha" type="password" autocomplete="current-password" autofocus required>
+        <button type="submit">Entrar</button>
+      </form>
+      <p class="nota">Este navegador fica conectado por ${DIAS_SESSAO_PAINEL} dias.</p>
+    `}
+  </div>
+</body>
+</html>`);
+});
+
+app.post('/login', (req, res) => {
+  const ip = req.headers['x-forwarded-for']?.split(',')[0].trim() || req.ip || 'desconhecido';
+  const de = typeof req.body.de === 'string' && req.body.de.startsWith('/') ? req.body.de : '/painel';
+
+  if (!PAINEL_SENHA) return res.redirect('/login');
+  if (!podeTentarLogin(ip)) return res.redirect('/login?erro=bloqueado');
+
+  if (!iguaisEmTempoConstante(req.body.senha || '', PAINEL_SENHA)) {
+    registrarErroLogin(ip);
+    console.log(`[LOGIN] Senha incorreta vinda de ${ip}.`);
+    return res.redirect(`/login?erro=invalida&de=${encodeURIComponent(de)}`);
+  }
+
+  tentativasLogin.delete(ip);
+  // Secure só quando a conexão é HTTPS, senão o cookie não gruda em teste local.
+  const https = req.headers['x-forwarded-proto'] === 'https' || req.protocol === 'https';
+  res.setHeader('Set-Cookie', [
+    `${COOKIE_SESSAO}=${criarTokenSessao()}`,
+    'Path=/',
+    'HttpOnly',
+    'SameSite=Lax',
+    `Max-Age=${DIAS_SESSAO_PAINEL * 86400}`,
+    ...(https ? ['Secure'] : [])
+  ].join('; '));
+  res.redirect(de);
+});
+
+app.post('/logout', (req, res) => {
+  res.setHeader('Set-Cookie', `${COOKIE_SESSAO}=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0`);
+  res.redirect('/login');
 });
 
 app.get('/contas', (req, res) => {
