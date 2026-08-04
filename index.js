@@ -2099,33 +2099,74 @@ app.get('/health', (req, res) => {
 });
 
 app.get('/qr', async (req, res) => {
-  const pagina = (miolo) => `
-    <html>
-      <head><meta http-equiv="refresh" content="15"></head>
-      <body style="font-family: sans-serif; text-align: center; padding: 40px;">
-        ${miolo}
-      </body>
-    </html>`;
+  const cfg = configContas.get();
+  const rotuloConta = cfg.ativa ? (cfg.contas?.[cfg.ativa]?.rotulo || cfg.ativa) : null;
 
-  if (isConnected) {
-    return res.send(pagina('<h2>✅ WhatsApp já conectado</h2>'));
+  // Página separada de propósito: ela se recarrega sozinha a cada 15s porque o QR expira rápido,
+  // e não faz sentido ficar recarregando a tela de contas por causa disso.
+  const autoRefresh = !isConnected ? '<script>setTimeout(() => location.reload(), 15000);</script>' : '';
+
+  let miolo;
+  if (!cfg.ativa) {
+    miolo = `
+      <div class="painel-qr painel-qr--neutro">
+        <h2>Bot desligado</h2>
+        <p>Não há conta ativa pra parear. Ative uma conta primeiro.</p>
+        <a class="botao-link" href="/contas">Ir para Contas</a>
+      </div>`;
+  } else if (isConnected) {
+    miolo = `
+      <div class="painel-qr painel-qr--ok">
+        <h2>✅ Já conectado</h2>
+        <p>A conta <strong>${escapeHtml(rotuloConta)}</strong> está pareada e no ar. Não precisa escanear nada.</p>
+        <a class="botao-link" href="/contas">Voltar para Contas</a>
+      </div>`;
+  } else if (!currentQR) {
+    miolo = `
+      <div class="painel-qr painel-qr--esperando">
+        <h2>Preparando o código…</h2>
+        <p>O QR da conta <strong>${escapeHtml(rotuloConta)}</strong> aparece aqui em alguns segundos. Esta página se atualiza sozinha.</p>
+      </div>`;
+  } else {
+    try {
+      const imagem = await QRCode.toDataURL(currentQR, { width: 300 });
+      miolo = `
+      <div class="painel-qr">
+        <h2>Escaneie com o número da conta<br><em>${escapeHtml(rotuloConta)}</em></h2>
+        <p>No celular: <strong>Aparelhos conectados → Conectar aparelho</strong></p>
+        <img src="${imagem}" width="300" height="300" alt="QR code para parear">
+        <p class="nota">O código expira em segundos. Esta página se atualiza sozinha a cada 15s com um novo — não precisa fazer nada.</p>
+        <a class="botao-link" href="/contas">Voltar para Contas</a>
+      </div>`;
+    } catch (err) {
+      miolo = `<div class="painel-qr painel-qr--neutro"><h2>Erro ao gerar o QR</h2><p>${escapeHtml(err.message)}</p></div>`;
+    }
   }
 
-  if (!currentQR) {
-    return res.send(pagina('<h2>Aguardando QR code...</h2><p>Atualiza sozinho a cada 15s</p>'));
-  }
-
-  try {
-    const dataUrl = await QRCode.toDataURL(currentQR, { width: 320 });
-    res.send(pagina(`
-      <h2>Escaneie no WhatsApp</h2>
-      <p>Aparelhos conectados → Conectar aparelho</p>
-      <img src="${dataUrl}" width="320" height="320" alt="QR code" />
-      <p style="color:#666">Expira rápido — se não escanear a tempo, a página atualiza sozinha com um novo</p>
-    `));
-  } catch (err) {
-    res.status(500).send('Erro ao gerar QR: ' + err.message);
-  }
+  res.send(paginaHtml({
+    titulo: 'Parear número',
+    ativo: '/contas',
+    largura: 560,
+    scriptExtra: autoRefresh,
+    cssExtra: `
+    .painel-qr { background: var(--superficie); border: 1px solid var(--dourado); border-radius: 14px; padding: 26px 20px; margin-top: 18px; text-align: center; }
+    .painel-qr--ok { border-color: var(--verde); }
+    .painel-qr--neutro { border-color: var(--linha); }
+    .painel-qr--esperando { border-style: dashed; }
+    .painel-qr h2 { font-family: 'Fraunces', Georgia, serif; font-size: 20px; font-weight: 600; margin: 0 0 8px; line-height: 1.35; }
+    .painel-qr h2 em { font-style: normal; color: var(--dourado); }
+    .painel-qr p { margin: 0 0 16px; font-size: 13.5px; color: var(--apagado); }
+    .painel-qr img { display: block; margin: 0 auto 16px; border-radius: 10px; max-width: 100%; height: auto; }
+    .painel-qr .nota { font-size: 12.5px; }
+    .botao-link { display: inline-block; font-weight: 600; font-size: 13.5px; text-decoration: none; color: var(--tinta); background: var(--papel); border: 1px solid var(--linha); padding: 9px 16px; border-radius: 8px; }
+    .botao-link:hover { border-color: var(--tinta); }`,
+    corpo: `
+    <header class="cabecalho">
+      <h1>Parear número</h1>
+      <p>Conectar um número de WhatsApp à conta ativa do bot.</p>
+    </header>
+    ${miolo}`
+  }));
 });
 
 // --- Casca compartilhada das páginas do painel ---
@@ -3204,6 +3245,15 @@ app.get('/contas', (req, res) => {
         : ''}
     </div>
 
+    ${cfg.ativa && !isConnected ? `
+    <a class="chamada-qr" href="/qr">
+      <div>
+        <strong>Esta conta ainda não foi pareada</strong>
+        <span>Abra a página do QR code e escaneie com o número desta conta.</span>
+      </div>
+      <span class="chamada-qr__seta">Abrir QR →</span>
+    </a>` : ''}
+
     <section class="secao">
       <p class="secao__olho">Números pareados</p>
       <h2>Suas contas (${Object.keys(contas).length})</h2>
@@ -3227,6 +3277,11 @@ app.get('/contas', (req, res) => {
     ativo: '/contas',
     largura: 720,
     cssExtra: `
+    .chamada-qr { display: flex; align-items: center; justify-content: space-between; gap: 14px; flex-wrap: wrap; text-decoration: none; color: inherit; background: var(--superficie); border: 1px solid var(--dourado); border-radius: 12px; padding: 15px 18px; margin-top: 16px; }
+    .chamada-qr:hover { background: var(--dourado-suave); }
+    .chamada-qr strong { display: block; font-family: 'Fraunces', Georgia, serif; font-size: 16px; margin-bottom: 2px; }
+    .chamada-qr span { font-size: 13.5px; color: var(--apagado); }
+    .chamada-qr__seta { font-weight: 600; font-size: 13.5px; color: #6B4E14 !important; white-space: nowrap; }
     .chave-geral { display: flex; align-items: center; justify-content: space-between; gap: 14px; flex-wrap: wrap; background: var(--superficie); border: 1px solid var(--linha); border-left: 5px solid var(--linha); border-radius: 12px; padding: 16px 18px; margin-top: 18px; }
     .chave-geral--ligado { border-left-color: var(--verde); }
     .chave-geral--desligado { border-left-color: var(--vermelho); }
