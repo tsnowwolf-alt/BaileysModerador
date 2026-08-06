@@ -344,6 +344,70 @@ async function migrarSessaoSolta() {
   }
 }
 
+// --- Resposta automática em conversa privada ---
+//
+// O WhatsApp comum não tem "mensagem de saudação": isso é recurso do app Business, executado no
+// celular. Como o bot já recebe as mensagens privadas dele (e hoje simplesmente descarta), dá pra
+// fazer aqui — e com a vantagem de funcionar com o celular desligado.
+//
+// Responder automaticamente a desconhecido é padrão que a detecção de abuso do WhatsApp marca,
+// então as travas abaixo não são detalhe, são o que torna isso seguro:
+//   • uma resposta por contato, com carência de dias antes de repetir
+//   • só mensagem que chega AGORA — sincronização de histórico é ignorada, senão o primeiro boot
+//     depois do pareamento dispararia uma resposta pra cada conversa antiga de uma vez
+//   • teto por hora, como freio de emergência caso algo escape
+const configResposta = criarValorPersistente('resposta-automatica.json', {
+  ativa: false,
+  texto: 'Nosso atendimento agradece seu contato. Por aqui não atendemos solicitações, favor entrar em contato no número 1198669-4787',
+  diasParaRepetir: 14
+});
+const persistSaudacoes = criarMapaPersistente('saudacoes-enviadas.json');
+
+const MAX_RESPOSTAS_POR_HORA = 20;
+const IDADE_MAXIMA_RESPOSTA_MS = 60 * 60_000;
+let respostasNaHora = { contagem: 0, desde: Date.now() };
+
+function podeResponderAgora() {
+  if (Date.now() - respostasNaHora.desde > 3600_000) respostasNaHora = { contagem: 0, desde: Date.now() };
+  return respostasNaHora.contagem < MAX_RESPOSTAS_POR_HORA;
+}
+
+async function responderPrivadoSePreciso(msg, type, jid) {
+  const cfg = configResposta.get();
+  if (!cfg.ativa || !cfg.texto?.trim()) return;
+
+  // Só conversa individual de verdade: nada de status, canal ou lista de transmissão.
+  if (!jid || jid.endsWith('@g.us') || jid.endsWith('@broadcast') || jid.endsWith('@newsletter')) return;
+
+  // Histórico sincronizado não dispara resposta. Sem isso, o primeiro boot depois de parear um
+  // número novo responderia todas as conversas antigas de uma vez — exatamente o comportamento
+  // que faz o WhatsApp derrubar a conta.
+  if (type !== 'notify') return;
+  const ts = timestampDaMensagem(msg);
+  if (ts && Date.now() - ts * 1000 > IDADE_MAXIMA_RESPOSTA_MS) return;
+
+  if (await participantEstaNaLista(jid, persistProtegidos.mapa)) return;
+
+  const jaEnviado = persistSaudacoes.mapa.get(jid);
+  const carenciaMs = Math.max(0, Number(cfg.diasParaRepetir) || 0) * 86400_000;
+  if (jaEnviado?.quando && Date.now() - new Date(jaEnviado.quando).getTime() < carenciaMs) return;
+
+  if (!podeResponderAgora()) {
+    console.warn(`[RESPOSTA] Teto de ${MAX_RESPOSTAS_POR_HORA}/h atingido — resposta para ${jid} não enviada.`);
+    return;
+  }
+
+  try {
+    respostasNaHora.contagem++;
+    await enviarComDigitando(jid, cfg.texto.trim());
+    persistSaudacoes.mapa.set(jid, { quando: new Date().toISOString(), nome: msg.pushName || null });
+    persistSaudacoes.agendarSalvar();
+    console.log(`[RESPOSTA] Saudação enviada para ${msg.pushName || jid}.`);
+  } catch (err) {
+    console.error(`[RESPOSTA] Falha ao responder ${jid}:`, err.message);
+  }
+}
+
 // IDs de mensagem já processadas, pra nunca reagir duas vezes à mesma mensagem.
 const processedMessageIds = new Set();
 
@@ -962,6 +1026,8 @@ async function flushTudo() {
     historicoModeracao.flush(),
     persistRegras.flush(),
     configContas.flush(),
+    configResposta.flush(),
+    persistSaudacoes.flush(),
     persistBanidos.flush(),
     persistLiberados.flush(),
     persistProtegidos.flush()
@@ -1505,7 +1571,7 @@ async function verificarCicloDebate() {
 const ARQUIVOS_PROPRIOS_NO_AUTH_FOLDER = new Set([
   'contatos.json', 'violations.json', 'config-debate.json', 'estado-debate.json',
   'topicos-enquete.json', 'mensagens-enviadas.json', 'numeros-banidos.json', 'numeros-liberados.json',
-  'numeros-protegidos.json', 'marca-dagua-mensagens.json', 'boots.json', 'historico-moderacao.json', 'regras.json', 'contas.json'
+  'numeros-protegidos.json', 'marca-dagua-mensagens.json', 'boots.json', 'historico-moderacao.json', 'regras.json', 'contas.json', 'resposta-automatica.json', 'saudacoes-enviadas.json'
 ]);
 
 // Agora que sessão e dados moram em diretórios diferentes, a limpeza é trivial e segura: apaga
@@ -1622,6 +1688,8 @@ async function connectToWhatsApp() {
     historicoModeracao.carregar(),
     persistRegras.carregar(),
     configContas.carregar(),
+    configResposta.carregar(),
+    persistSaudacoes.carregar(),
     registrarBoot(),
     semearListaDoEnvSeVazia(persistBanidos, 'NUMEROS_BANIDOS', 'Números banidos'),
     semearListaDoEnvSeVazia(persistLiberados, 'NUMEROS_LIBERADOS_DIVULGACAO', 'Números liberados pra divulgação'),
@@ -1852,6 +1920,8 @@ function extrairTextoDeContainer(conteudo, tipoConteudo) {
 
     const grupoId = msg.key.remoteJid;
     if (!grupoId || !grupoId.endsWith('@g.us')) {
+      // Conversa individual: não há moderação a fazer, mas pode haver resposta automática.
+      await responderPrivadoSePreciso(msg, type, grupoId);
       return;
     }
 
@@ -2181,7 +2251,8 @@ const MENU_PAINEL = [
   { href: '/painel', rotulo: 'Mesa de Debate', icone: '🗳️' },
   { href: '/contatos', rotulo: 'Contatos', icone: '👥' },
   { href: '/banidos', rotulo: 'Banidos', icone: '🚫' },
-  { href: '/contas', rotulo: 'Contas', icone: '📱' }
+  { href: '/contas', rotulo: 'Contas', icone: '📱' },
+  { href: '/resposta', rotulo: 'Resposta automática', icone: '💬' }
 ];
 
 function paginaHtml({ titulo, ativo, largura = 860, cssExtra = '', corpo, scriptExtra = '' }) {
@@ -3194,6 +3265,109 @@ app.post('/login', (req, res) => {
 app.post('/logout', (req, res) => {
   res.setHeader('Set-Cookie', `${COOKIE_SESSAO}=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0`);
   res.redirect('/login');
+});
+
+app.post('/resposta', (req, res) => {
+  const texto = String(req.body.texto || '').slice(0, 1500);
+  const dias = Math.min(365, Math.max(0, Number(req.body.dias) || 0));
+  const ativa = req.body.ativa === 'on';
+  configResposta.set({ ativa, texto, diasParaRepetir: dias });
+  res.redirect(`/resposta?aviso=${encodeURIComponent(ativa ? 'Resposta automática ligada.' : 'Resposta automática desligada.')}`);
+});
+
+app.post('/resposta/limpar', (req, res) => {
+  persistSaudacoes.mapa.clear();
+  persistSaudacoes.agendarSalvar();
+  res.redirect(`/resposta?aviso=${encodeURIComponent('Histórico limpo. Todo mundo pode receber a saudação de novo.')}`);
+});
+
+app.get('/resposta', (req, res) => {
+  const cfg = configResposta.get();
+  const enviadas = [...persistSaudacoes.mapa.entries()]
+    .sort((a, b) => new Date(b[1].quando) - new Date(a[1].quando))
+    .slice(0, 40);
+
+  const linhas = enviadas.map(([jid, info]) => `
+      <li>
+        <strong>${escapeHtml(info.nome || 'Sem nome')}</strong>
+        <code class="copiavel" data-copiar="${escapeHtml(jid)}">${escapeHtml(jid)}</code>
+        <time>${new Date(info.quando).toLocaleString('pt-BR', { timeZone: FUSO_HORARIO })}</time>
+      </li>`).join('');
+
+  res.send(paginaHtml({
+    titulo: 'Resposta automática',
+    ativo: '/resposta',
+    largura: 680,
+    cssExtra: `
+    .estado { display: flex; align-items: center; justify-content: space-between; gap: 14px; flex-wrap: wrap; background: var(--superficie); border: 1px solid var(--linha); border-left: 5px solid var(--linha); border-radius: 12px; padding: 16px 18px; margin-top: 18px; }
+    .estado--ligada { border-left-color: var(--verde); }
+    .estado strong { display: block; font-family: 'Fraunces', Georgia, serif; font-size: 17px; margin-bottom: 2px; }
+    .estado span { font-size: 13.5px; color: var(--apagado); }
+    .cartao { background: var(--superficie); border: 1px solid var(--linha); border-radius: 12px; padding: 18px; margin-top: 16px; }
+    .campo { display: block; font-size: 13.5px; font-weight: 500; margin-bottom: 14px; }
+    .campo textarea { font: inherit; font-size: 15px; width: 100%; min-height: 130px; margin-top: 6px; padding: 12px 14px; border: 1px solid var(--linha); border-radius: 9px; background: var(--papel); color: var(--tinta); resize: vertical; line-height: 1.55; }
+    .campo input[type=number] { font: inherit; font-family: 'IBM Plex Mono', monospace; width: 90px; margin-top: 6px; padding: 9px 11px; border: 1px solid var(--linha); border-radius: 8px; background: var(--papel); color: var(--tinta); }
+    .campo textarea:focus-visible, .campo input:focus-visible { outline: 2px solid var(--dourado); outline-offset: 1px; background: var(--superficie); }
+    .campo small { display: block; font-weight: 400; color: var(--apagado); font-size: 12.5px; margin-top: 4px; }
+    .liga { display: flex; align-items: flex-start; gap: 10px; font-size: 14.5px; font-weight: 500; margin-bottom: 16px; }
+    .liga input { width: 20px; height: 20px; margin: 1px 0 0; flex-shrink: 0; }
+    .liga small { display: block; font-weight: 400; color: var(--apagado); font-size: 12.5px; margin-top: 3px; }
+    .alerta { background: var(--dourado-suave); color: #6B4E14; border-radius: 9px; padding: 12px 14px; font-size: 13px; margin-top: 16px; line-height: 1.5; }
+    .lista { list-style: none; padding: 0; margin: 12px 0 0; }
+    .lista li { display: flex; align-items: center; gap: 9px; flex-wrap: wrap; padding: 9px 0; border-bottom: 1px solid var(--linha); font-size: 13.5px; }
+    .lista li:last-child { border-bottom: none; }
+    .lista time { margin-left: auto; font-family: 'IBM Plex Mono', monospace; font-size: 11.5px; color: var(--apagado); }
+    .secao { margin-top: 30px; }
+    .secao h2 { font-family: 'Fraunces', Georgia, serif; font-size: 20px; font-weight: 600; margin: 0 0 6px; }
+    .vazio { color: var(--apagado); font-size: 13.5px; margin: 10px 0 0; }`,
+    corpo: `
+    <header class="cabecalho">
+      <h1>Resposta automática</h1>
+      <p>Responde quem manda mensagem no privado do número do bot. Funciona sem WhatsApp Business e com o celular desligado.</p>
+    </header>
+    ${req.query.aviso ? `<div class="aviso-sucesso">${escapeHtml(req.query.aviso)}</div>` : ''}
+
+    <div class="estado ${cfg.ativa ? 'estado--ligada' : ''}">
+      <div>
+        <strong>${cfg.ativa ? 'Ligada' : 'Desligada'}</strong>
+        <span>${cfg.ativa ? 'Quem escrever no privado recebe a mensagem abaixo.' : 'Mensagens privadas são ignoradas em silêncio.'}</span>
+      </div>
+    </div>
+
+    <form class="cartao" method="POST" action="/resposta">
+      <label class="liga">
+        <input type="checkbox" name="ativa" ${cfg.ativa ? 'checked' : ''}>
+        <span>Responder automaticamente no privado
+          <small>Desmarque para desligar sem perder o texto.</small>
+        </span>
+      </label>
+
+      <label class="campo">Mensagem
+        <textarea name="texto" placeholder="O que responder a quem escrever no privado…">${escapeHtml(cfg.texto || '')}</textarea>
+      </label>
+
+      <label class="campo">Repetir depois de
+        <input type="number" name="dias" min="0" max="365" value="${Number(cfg.diasParaRepetir) || 0}">
+        <small>Dias de carência antes de responder a mesma pessoa de novo. O WhatsApp Business usa 14. Com 0, responde só uma vez e nunca mais.</small>
+      </label>
+
+      <button class="botao" type="submit">Salvar</button>
+
+      <div class="alerta">
+        <strong>Por que só uma vez por pessoa:</strong> responder toda mensagem de desconhecido é o padrão que a detecção de abuso do WhatsApp marca — e este grupo já foi suspenso uma vez. O bot também ignora sincronização de histórico e para em ${MAX_RESPOSTAS_POR_HORA} respostas por hora.
+      </div>
+    </form>
+
+    <section class="secao">
+      <h2>Já responderam (${persistSaudacoes.mapa.size})</h2>
+      ${enviadas.length > 0
+        ? `<ul class="lista">${linhas}</ul>
+           <form method="POST" action="/resposta/limpar" onsubmit="return confirm('Limpar o histórico? Todo mundo pode receber a saudação de novo.')">
+             <button class="botao-secundario" type="submit" style="margin-top:14px">Limpar histórico</button>
+           </form>`
+        : '<p class="vazio">Ninguém recebeu a saudação ainda.</p>'}
+    </section>`
+  }));
 });
 
 app.get('/contas', (req, res) => {
