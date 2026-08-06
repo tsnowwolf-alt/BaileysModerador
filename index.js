@@ -474,6 +474,32 @@ function mensagemCitada(conteudo) {
   return { autor, texto: (texto || `[${tipoCitado || 'mídia'}]`).slice(0, 300) };
 }
 
+// --- Prévia do link ---
+//
+// Quando alguém manda um link, o WhatsApp anexa título, descrição e domínio do destino dentro
+// do extendedTextMessage. O bot enviava só o `text` da mensagem — num link solto isso é a URL
+// crua, e a IA não tinha como saber se apontava para uma música ou para um cassino.
+// Vai como campo separado de propósito: esse texto é do SITE, não é o que a pessoa escreveu.
+function extrairPreviaLink(conteudo) {
+  const ext = conteudo?.extendedTextMessage;
+  if (!ext) return null;
+
+  const url = ext.canonicalUrl || ext.matchedText || null;
+  const titulo = (ext.title || '').trim();
+  const descricao = (ext.description || '').trim();
+  if (!url && !titulo && !descricao) return null;
+
+  let dominio = null;
+  try { if (url) dominio = new URL(url).hostname.replace(/^www\./, ''); } catch { /* url torta */ }
+
+  return {
+    url: url ? url.slice(0, 300) : null,
+    dominio,
+    titulo: titulo.slice(0, 200),
+    descricao: descricao.slice(0, 400)
+  };
+}
+
 // IDs de mensagem já processadas, pra nunca reagir duas vezes à mesma mensagem.
 const processedMessageIds = new Set();
 
@@ -2187,6 +2213,9 @@ function extrairTextoDeContainer(conteudo, tipoConteudo) {
       // recomendação (link pedido ou encaixado na conversa) de divulgação (link solto).
       conversa_recente: conversaAntesDe(grupoId),
       respondendo_a: mensagemCitada(conteudo),
+      // Título e descrição que o WhatsApp puxou do destino do link. É o que permite julgar um
+      // link solto, sem nenhum texto acompanhando.
+      previa_link: extrairPreviaLink(conteudo),
       pode_divulgar: podeDivulgar,
       debate_ativo: debateAtivo,
       tema_debate: debateAtivo ? estadoAtualDebate.tema : null,
