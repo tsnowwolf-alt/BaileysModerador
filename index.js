@@ -374,23 +374,35 @@ function podeResponderAgora() {
 
 async function responderPrivadoSePreciso(msg, type, jid) {
   const cfg = configResposta.get();
-  if (!cfg.ativa || !cfg.texto?.trim()) return;
 
-  // Só conversa individual de verdade: nada de status, canal ou lista de transmissão.
+  // Cada motivo de não responder sai no log. Antes eram returns mudos: a resposta simplesmente
+  // não acontecia e não havia como descobrir qual das seis travas tinha pegado.
+  const pular = (motivo) => { console.log(`[RESPOSTA] Ignorado (${motivo}): ${msg.pushName || jid}`); };
+
   if (!jid || jid.endsWith('@g.us') || jid.endsWith('@broadcast') || jid.endsWith('@newsletter')) return;
+  if (!cfg.ativa) return pular('resposta automática desligada em /resposta');
+  if (!cfg.texto?.trim()) return pular('texto da resposta está vazio');
 
   // Histórico sincronizado não dispara resposta. Sem isso, o primeiro boot depois de parear um
   // número novo responderia todas as conversas antigas de uma vez — exatamente o comportamento
   // que faz o WhatsApp derrubar a conta.
-  if (type !== 'notify') return;
-  const ts = timestampDaMensagem(msg);
-  if (ts && Date.now() - ts * 1000 > IDADE_MAXIMA_RESPOSTA_MS) return;
+  if (type !== 'notify') return pular(`veio como "${type}", não é mensagem nova`);
 
-  if (await participantEstaNaLista(jid, persistProtegidos.mapa)) return;
+  const ts = timestampDaMensagem(msg);
+  if (ts && Date.now() - ts * 1000 > IDADE_MAXIMA_RESPOSTA_MS) {
+    return pular(`mensagem tem ${Math.round((Date.now() - ts * 1000) / 60000)} min, mais velha que o limite de 60`);
+  }
+
+  if (await participantEstaNaLista(jid, persistProtegidos.mapa)) {
+    return pular('número está na lista de PROTEGIDOS — protegido não recebe saudação');
+  }
 
   const jaEnviado = persistSaudacoes.mapa.get(jid);
   const carenciaMs = Math.max(0, Number(cfg.diasParaRepetir) || 0) * 86400_000;
-  if (jaEnviado?.quando && Date.now() - new Date(jaEnviado.quando).getTime() < carenciaMs) return;
+  if (jaEnviado?.quando && Date.now() - new Date(jaEnviado.quando).getTime() < carenciaMs) {
+    const dias = Math.floor((Date.now() - new Date(jaEnviado.quando).getTime()) / 86400_000);
+    return pular(`já recebeu há ${dias} dia(s), carência é de ${cfg.diasParaRepetir}`);
+  }
 
   if (!podeResponderAgora()) {
     console.warn(`[RESPOSTA] Teto de ${MAX_RESPOSTAS_POR_HORA}/h atingido — resposta para ${jid} não enviada.`);
@@ -406,6 +418,60 @@ async function responderPrivadoSePreciso(msg, type, jid) {
   } catch (err) {
     console.error(`[RESPOSTA] Falha ao responder ${jid}:`, err.message);
   }
+}
+
+// --- Contexto da conversa ---
+//
+// A IA recebia só a mensagem isolada. Com isso, um link de suplemento respondendo a "alguém
+// conhece um bom ômega 3?" e o mesmo link jogado do nada chegavam nela idênticos — não havia
+// como distinguir recomendação de divulgação, porque a informação que separa as duas coisas
+// (o que veio antes) não estava sendo enviada.
+const JANELA_CONVERSA_MS = 20 * 60_000;
+const MAX_CONVERSA = 8;
+const historicoConversa = new Map();
+
+function guardarNaConversa(grupoId, autor, texto, tipo) {
+  // Mídia aparece com o tipo à frente da legenda: "[imagem] olha esse aqui". Sem isso, a IA lia
+  // a legenda como se fosse mensagem de texto e perdia que havia um arquivo na conversa.
+  const legenda = (texto || '').trim();
+  const resumo = tipo === 'texto' ? legenda : `[${tipo}]${legenda ? ' ' + legenda : ''}`;
+  const lista = (historicoConversa.get(grupoId) || []).filter((m) => Date.now() - m.quando < JANELA_CONVERSA_MS);
+  lista.push({ autor, texto: resumo.slice(0, 220), quando: Date.now() });
+  if (lista.length > MAX_CONVERSA) lista.splice(0, lista.length - MAX_CONVERSA);
+  historicoConversa.set(grupoId, lista);
+  while (historicoConversa.size > 20) historicoConversa.delete(historicoConversa.keys().next().value);
+}
+
+// Devolve a conversa ANTES da mensagem atual (ela já foi guardada quando isto é chamado).
+function conversaAntesDe(grupoId) {
+  const lista = (historicoConversa.get(grupoId) || []).filter((m) => Date.now() - m.quando < JANELA_CONVERSA_MS);
+  return lista.slice(0, -1).map((m) => `${m.autor}: ${m.texto}`);
+}
+
+// Responder a alguém é o sinal mais forte de que a mensagem tem contexto: link em resposta a uma
+// pergunta é recomendação, link solto é divulgação. O contextInfo fica em lugares diferentes
+// dependendo do tipo de mensagem, por isso a varredura.
+function mensagemCitada(conteudo) {
+  const ctx = conteudo?.extendedTextMessage?.contextInfo
+    || conteudo?.imageMessage?.contextInfo
+    || conteudo?.videoMessage?.contextInfo
+    || conteudo?.documentMessage?.contextInfo
+    || conteudo?.audioMessage?.contextInfo
+    || conteudo?.stickerMessage?.contextInfo;
+  if (!ctx?.quotedMessage) return null;
+
+  const citado = normalizarConteudo(ctx.quotedMessage);
+  const tipoCitado = tipoDoConteudo(citado);
+  const texto = citado?.conversation
+    || citado?.extendedTextMessage?.text
+    || citado?.imageMessage?.caption
+    || citado?.videoMessage?.caption
+    || citado?.documentMessage?.caption
+    || '';
+
+  const autorJid = ctx.participant || null;
+  const autor = (autorJid && contatosVistos.get(autorJid)?.nome) || autorJid || 'alguém';
+  return { autor, texto: (texto || `[${tipoCitado || 'mídia'}]`).slice(0, 300) };
 }
 
 // IDs de mensagem já processadas, pra nunca reagir duas vezes à mesma mensagem.
@@ -442,11 +508,21 @@ function normalizarParaComparar(texto) {
     .replace(/\s+/g, ' ');
 }
 
+// Impressão digital do arquivo, pra detectar a MESMA mídia reenviada. Sem isso, quem manda a
+// mesma imagem de divulgação sete vezes passava batido: sem legenda não havia texto pra comparar,
+// e a contagem de repetição devolvia sempre 1.
+function impressaoDaMidia(midiaBase64, audioBase64, framesBase64) {
+  const pedacos = [midiaBase64, audioBase64, ...(Array.isArray(framesBase64) ? framesBase64 : [])].filter(Boolean);
+  if (pedacos.length === 0) return null;
+  return 'midia' + crypto.createHash('sha256').update(pedacos.join('|')).digest('hex').slice(0, 32);
+}
+
 // Devolve quantas vezes ESTA mensagem apareceu na janela, contando a atual.
 // 1 = mensagem inédita. 2+ = repetiu.
-function contarRepeticoes(chave, texto) {
-  const alvo = normalizarParaComparar(texto);
-  if (!alvo) return 1;   // sem texto (imagem/áudio sem legenda) não dá pra comparar
+// Compara pela legenda quando existe; sem legenda, cai na impressão digital do arquivo.
+function contarRepeticoes(chave, texto, impressaoMidia = null) {
+  const alvo = normalizarParaComparar(texto) || impressaoMidia;
+  if (!alvo) return 1;
 
   const agora = Date.now();
   const lista = (historicoTextos.get(chave) || []).filter((r) => agora - r.quando < JANELA_REPETICAO_MS);
@@ -2030,8 +2106,11 @@ function extrairTextoDeContainer(conteudo, tipoConteudo) {
 
     const participant = msg.key.participant || grupoId;
     const remetente = msg.pushName || participant;
+
+    // Registra ANTES do corte de protegidos: se o dono perguntou "alguém conhece um bom ômega 3?",
+    // essa pergunta precisa estar no contexto mesmo sem ter ido pra moderação.
+    guardarNaConversa(grupoId, remetente, texto, tipo);
     const mensagensRecentes = contarMensagensRecentes(`${grupoId}:${participant}`);
-    const vezesQueRepetiu = contarRepeticoes(`${grupoId}:${participant}`, texto);
     // Protegido não é moderado, ponto final. Antes essa checagem existia só no /apagar e no
     // /registrar-violacao — o /avisar não tinha como checar, porque o n8n manda só grupo_id e
     // mensagem, sem dizer de quem é o aviso. Resultado: pessoa protegida levava aviso do bot.
@@ -2084,6 +2163,13 @@ function extrairTextoDeContainer(conteudo, tipoConteudo) {
     const estadoAtualDebate = estadoDebate.get();
     const debateAtivo = estadoAtualDebate.fase === 'debate' && estadoAtualDebate.grupoId === grupoId;
 
+    // Só agora a mídia está baixada, então é aqui que dá pra comparar arquivo com arquivo.
+    const vezesQueRepetiu = contarRepeticoes(
+      `${grupoId}:${participant}`,
+      texto,
+      impressaoDaMidia(midiaBase64, audioBase64, framesBase64)
+    );
+
     const payload = {
       grupo_id: grupoId,
       message_id: msgId,
@@ -2097,6 +2183,10 @@ function extrairTextoDeContainer(conteudo, tipoConteudo) {
       // 1 = inédita. 2+ = repetida. É este o campo que o prompt deve usar pra julgar spam.
       mensagens_identicas_5min: vezesQueRepetiu,
       mensagem_repetida: vezesQueRepetiu >= 2,
+      // Contexto: o que veio antes e a quem esta mensagem responde. É o que permite separar
+      // recomendação (link pedido ou encaixado na conversa) de divulgação (link solto).
+      conversa_recente: conversaAntesDe(grupoId),
+      respondendo_a: mensagemCitada(conteudo),
       pode_divulgar: podeDivulgar,
       debate_ativo: debateAtivo,
       tema_debate: debateAtivo ? estadoAtualDebate.tema : null,
@@ -3352,6 +3442,10 @@ app.get('/resposta', (req, res) => {
       </label>
 
       <button class="botao" type="submit">Salvar</button>
+
+      <div class="alerta">
+        <strong>Números protegidos não recebem esta mensagem.</strong> Se você testar mandando do seu próprio número, nada vai acontecer — o seu está na lista de protegidos. Teste com um número que não esteja lá.
+      </div>
 
       <div class="alerta">
         <strong>Por que só uma vez por pessoa:</strong> responder toda mensagem de desconhecido é o padrão que a detecção de abuso do WhatsApp marca — e este grupo já foi suspenso uma vez. O bot também ignora sincronização de histórico e para em ${MAX_RESPOSTAS_POR_HORA} respostas por hora.
