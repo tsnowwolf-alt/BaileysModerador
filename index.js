@@ -281,7 +281,8 @@ async function garantirProtegidosDoDono() {
   const identificadoresDono = [
     '5511986694787@s.whatsapp.net',   // dono, formato número
     '157728429347047@lid',            // dono, formato @lid
-    '5547996763184@s.whatsapp.net'    // protegido adicional, pedido em 04/08/2026
+    '5547996763184@s.whatsapp.net',   // protegido adicional, pedido em 04/08/2026
+    '230824427417681@lid'             // protegido adicional, pedido em 04/08/2026
   ];
   let mudou = false;
   for (const id of identificadoresDono) {
