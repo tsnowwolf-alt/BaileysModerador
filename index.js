@@ -421,6 +421,55 @@ async function responderPrivadoSePreciso(msg, type, jid) {
   }
 }
 
+// --- Remoção de participante ---
+//
+// sock.groupParticipantsUpdate NÃO lança exceção quando o servidor recusa: devolve um array com
+// status por participante ('403' sem permissão, '404' JID desconhecido, '200' sucesso). O código
+// antigo só usava try/catch, então uma recusa passava por sucesso — o bot anunciava "foi removido"
+// e a pessoa continuava no grupo.
+//
+// Além de conferir o status, tenta a outra forma do JID: em grupo @lid o identificador que chega
+// na mensagem nem sempre é o mesmo que o servidor aceita para remover. A groupMetadata é a
+// verdade sobre aquele grupo, então é de lá que sai a segunda tentativa.
+async function removerParticipante(grupoId, participant) {
+  const tentativas = [];
+
+  const tentar = async (jid, origem) => {
+    try {
+      const resultado = await sock.groupParticipantsUpdate(grupoId, [jid], 'remove');
+      const status = String(resultado?.[0]?.status ?? 'sem-resposta');
+      tentativas.push({ jid, origem, status });
+      return status === '200';
+    } catch (err) {
+      tentativas.push({ jid, origem, status: `erro: ${err.message}` });
+      return false;
+    }
+  };
+
+  if (await tentar(participant, 'jid da mensagem')) return { ok: true, tentativas };
+
+  // Segunda chance: o identificador exato que o grupo conhece.
+  try {
+    const metadata = await sock.groupMetadata(grupoId);
+    const base = numeroBase(participant);
+    const encontrado = (metadata?.participants || []).find((p) =>
+      [p.id, p.jid, p.lid, p.phoneNumber]
+        .filter((f) => typeof f === 'string')
+        .some((f) => f === participant || (base && numeroBase(f) === base)));
+
+    if (encontrado?.id && encontrado.id !== participant) {
+      if (await tentar(encontrado.id, 'groupMetadata')) return { ok: true, tentativas };
+    } else if (!encontrado) {
+      tentativas.push({ jid: participant, origem: 'groupMetadata', status: 'não está mais no grupo' });
+      return { ok: false, jaSaiu: true, tentativas };
+    }
+  } catch (err) {
+    tentativas.push({ jid: participant, origem: 'groupMetadata', status: `erro: ${err.message}` });
+  }
+
+  return { ok: false, tentativas };
+}
+
 // --- Contexto da conversa ---
 //
 // A IA recebia só a mensagem isolada. Com isso, um link de suplemento respondendo a "alguém
@@ -3005,6 +3054,7 @@ const ROTULOS_ACAO = {
   violacao: { texto: 'Violação registrada', classe: 'dourado', icone: '⚠️' },
   removido: { texto: 'Removido do grupo', classe: 'vermelho', icone: '🚪' },
   banido: { texto: 'Banido', classe: 'vermelho', icone: '🚫' },
+  remocao_falhou: { texto: 'Remoção FALHOU', classe: 'vermelho', icone: '⚠️' },
   aviso: { texto: 'Aviso enviado', classe: 'verde', icone: '💬' }
 };
 
@@ -3841,21 +3891,32 @@ app.post('/registrar-violacao', checkAuth, async (req, res) => {
 
   let removido = false;
 
+  let falhaRemocao = null;
+
   if (contagem >= REMOVE_THRESHOLD) {
-    try {
-      await sock.groupParticipantsUpdate(grupo_id, [participant], 'remove');
+    const resultado = await removerParticipante(grupo_id, participant);
+
+    if (resultado.ok) {
       zerarViolacoes(chave);
       removido = true;
       const motivo = regra ? ` Regra violada: ${regra}.` : '';
       await enviarComDigitando(grupo_id, `⚠️ ${remetente || participant} foi removido do grupo automaticamente após atingir ${REMOVE_THRESHOLD} violações.${motivo}`);
-    } catch (err) {
-      console.error('Erro ao remover participante:', err.message);
-      return res.status(500).json({ erro: err.message, contagem });
+    } else if (resultado.jaSaiu) {
+      // Saiu por conta própria antes da punição: zera a ficha e não anuncia nada.
+      zerarViolacoes(chave);
+      console.log(`[REMOÇÃO] ${remetente || participant} já não estava no grupo.`);
+    } else {
+      // NÃO anuncia. Anunciar remoção que não aconteceu é pior que não anunciar:
+      // o admin acha que foi resolvido e a pessoa continua no grupo.
+      falhaRemocao = resultado.tentativas;
+      console.error(`🔴 [REMOÇÃO FALHOU] ${remetente || participant} continua no grupo. Tentativas: ${JSON.stringify(resultado.tentativas)}`);
+      console.error('🔴 Causa mais comum: o bot não é admin do grupo, ou perdeu o admin.');
+      // Mantém a contagem no limite, pra tentar de novo na próxima violação.
     }
   }
 
   registrarEventoModeracao({
-    acao: removido ? 'removido' : 'violacao',
+    acao: removido ? 'removido' : falhaRemocao ? 'remocao_falhou' : 'violacao',
     grupoId: grupo_id,
     participant,
     remetente: nomeDaVez,
@@ -3866,7 +3927,7 @@ app.post('/registrar-violacao', checkAuth, async (req, res) => {
     contagem: removido ? REMOVE_THRESHOLD : contagem
   });
 
-  res.json({ ok: true, contagem, removido });
+  res.json({ ok: true, contagem, removido, falha_remocao: falhaRemocao });
 });
 
 app.listen(PORT, () => {
