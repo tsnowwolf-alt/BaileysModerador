@@ -29,6 +29,54 @@ async function converterAudioParaMp3(bufferOriginal) {
 }
 
 // Extrai alguns frames do vídeo como imagens — mais confiável hoje do que mandar o vídeo inteiro pra IA
+// Figurinha é WebP, e a maioria das figurinhas de hoje é WebP ANIMADO. Isso importa porque o
+// decodificador nativo de webp do ffmpeg NÃO lê webp animado — ele reclama de "unsupported chunk:
+// ANIM" e não escreve quadro nenhum. Testado, não suposto. Então não dá pra ter um comando só.
+//
+// A ordem abaixo é uma escada: cada degrau cobre o que o anterior não cobre, e o log diz qual
+// pegou. Se um dia nenhum funcionar na hospedagem, a linha de log aponta o problema direto, em
+// vez de a figurinha sumir em silêncio como acontecia antes.
+async function figurinhaParaImagem(bufferOriginal) {
+  const idTemp = Math.random().toString(36).slice(2);
+  const entrada = path.join(tmpdir(), `sticker-in-${idTemp}.webp`);
+  const animada = bufferOriginal.indexOf(Buffer.from('ANIM')) !== -1;
+
+  const degraus = [
+    // ffmpeg resolve figurinha estática, e é a única ferramenta que o bot já usa pra áudio/vídeo,
+    // então é a mais garantida de existir.
+    { nome: 'ffmpeg', saida: `sticker-out-${idTemp}.jpg`, mime: 'image/jpeg',
+      cmd: (e, s) => `ffmpeg -y -i "${e}" -frames:v 1 -q:v 3 "${s}"` },
+    // ImageMagick lê webp animado; o [0] pega o primeiro quadro.
+    { nome: 'imagemagick', saida: `sticker-im-${idTemp}.jpg`, mime: 'image/jpeg',
+      cmd: (e, s) => `convert "${e}[0]" "${s}"` },
+    // libwebp, se estiver instalada.
+    { nome: 'dwebp', saida: `sticker-dw-${idTemp}.png`, mime: 'image/png',
+      cmd: (e, s) => `dwebp "${e}" -o "${s}"` }
+  ];
+
+  try {
+    await writeFile(entrada, bufferOriginal);
+    for (const degrau of degraus) {
+      const saida = path.join(tmpdir(), degrau.saida);
+      try {
+        await execAsync(degrau.cmd(entrada, saida), { timeout: 15000 });
+        const bytes = await readFile(saida);
+        if (bytes.length === 0) throw new Error('arquivo vazio');
+        console.log(`[FIGURINHA] Convertida por ${degrau.nome}${animada ? ' (animada)' : ''}.`);
+        return { base64: bytes.toString('base64'), mime: degrau.mime };
+      } catch {
+        // degrau não deu conta; tenta o próximo
+      } finally {
+        await unlink(saida).catch(() => {});
+      }
+    }
+    console.error(`[FIGURINHA] Nenhum conversor deu conta${animada ? ' (animada)' : ''} — mandando o webp cru, a IA pode não conseguir ler.`);
+    return { base64: bufferOriginal.toString('base64'), mime: 'image/webp' };
+  } finally {
+    await unlink(entrada).catch(() => {});
+  }
+}
+
 async function extrairFramesDoVideo(bufferOriginal, duracaoSegundos) {
   const idTemp = Math.random().toString(36).slice(2);
   const entrada = path.join(tmpdir(), `video-in-${idTemp}.mp4`);
@@ -1175,6 +1223,7 @@ async function flushTudo() {
     persistTopicos.flush(),
     persistMensagensEnviadas.flush(),
     marcaDagua.flush(),
+    estadoConexao.flush(),
     historicoModeracao.flush(),
     persistRegras.flush(),
     configContas.flush(),
@@ -1723,7 +1772,7 @@ async function verificarCicloDebate() {
 const ARQUIVOS_PROPRIOS_NO_AUTH_FOLDER = new Set([
   'contatos.json', 'violations.json', 'config-debate.json', 'estado-debate.json',
   'topicos-enquete.json', 'mensagens-enviadas.json', 'numeros-banidos.json', 'numeros-liberados.json',
-  'numeros-protegidos.json', 'marca-dagua-mensagens.json', 'boots.json', 'historico-moderacao.json', 'regras.json', 'contas.json', 'resposta-automatica.json', 'saudacoes-enviadas.json'
+  'numeros-protegidos.json', 'marca-dagua-mensagens.json', 'boots.json', 'historico-moderacao.json', 'regras.json', 'contas.json', 'resposta-automatica.json', 'saudacoes-enviadas.json', 'estado-conexao.json'
 ]);
 
 // Agora que sessão e dados moram em diretórios diferentes, a limpeza é trivial e segura: apaga
@@ -1788,6 +1837,132 @@ function detectarTrocaDeConta() {
 // Troca a conta ativa (ou desliga, com nome = null) sem derrubar o processo. Fecha o socket
 // atual, grava a escolha e reconecta. O flag trocaEmAndamento impede que o handler de 'close'
 // dispare a reconexão automática no meio do caminho.
+// ============================================================
+// SOBREVIVER À QUEDA DE CONEXÃO
+//
+// O WhatsApp derruba sessão por motivos que não estão sob nosso controle: reinício do lado
+// deles, conflito com outra sessão, rede da hospedagem. Não dá pra impedir a queda; dá pra
+// impedir que ela vire uma janela longa de silêncio.
+//
+// Três coisas mudaram aqui:
+//   1. Espera crescente entre tentativas, em vez de 5s fixos. Reconectar de 5 em 5 segundos
+//      contra um servidor que está recusando é o que transforma queda de 1 minuto em bloqueio
+//      de meia hora.
+//   2. O motivo numérico da queda passou a ser registrado. Antes o log dizia só a mensagem de
+//      erro, que às vezes vem vazia, e ficava impossível saber por que caiu.
+//   3. Vigia de conexão morta em silêncio: socket meio aberto não dispara 'close', o bot acha
+//      que está conectado e simplesmente para de receber mensagem. É o modo de falha mais
+//      traiçoeiro, porque de fora parece que o bot está bem.
+// ============================================================
+const ESPERAS_RECONEXAO_MS = [3_000, 5_000, 10_000, 20_000, 40_000, 60_000, 120_000];
+let tentativasReconexao = 0;
+let ultimoSinalDeVida = Date.now();
+let vigiaConexaoIniciado = false;
+
+// ============================================================
+// AVISO DE QUEDA NO PRIVADO
+//
+// Limitação que não dá pra contornar: o único jeito que o bot tem de mandar mensagem no WhatsApp
+// é pelo socket que acabou de morrer. Avisar NO MOMENTO da queda é impossível — seria pedir pra
+// ele usar exatamente aquilo que parou de funcionar.
+//
+// Então o aviso é gravado em disco quando cai e disparado quando volta, dizendo quanto tempo
+// ficou fora e por quê. Gravar em disco (e não numa variável) é o que faz o aviso sobreviver
+// quando o próprio processo morre e o Railway sobe outro: nesse caso a variável sumiria junto.
+//
+// O que isso NÃO cobre: bot que cai e não volta. Se o processo estiver morto, nada dentro dele
+// avisa. Pra esse caso o que serve é um monitor externo batendo no /status de fora.
+// ============================================================
+const NUMERO_ALERTA = (process.env.NUMERO_ALERTA_QUEDA || '5511986694787').replace(/\D/g, '');
+const QUEDA_MINIMA_PRA_AVISAR_MS = Number(process.env.QUEDA_MINIMA_PRA_AVISAR_MS || 60_000);
+const INTERVALO_MINIMO_ENTRE_AVISOS_MS = Number(process.env.INTERVALO_MINIMO_ENTRE_AVISOS_MS || 15 * 60_000);
+
+const estadoConexao = criarValorPersistente('estado-conexao.json', {
+  caiuEm: null,
+  motivo: null,
+  ultimoAvisoEm: null
+});
+
+function registrarQueda(statusCode, mensagemErro) {
+  // Só a PRIMEIRA queda da sequência conta. Reconexão que falha três vezes seguidas é uma queda
+  // só do ponto de vista de quem está lendo o aviso, não três.
+  if (estadoConexao.get().caiuEm) return;
+  estadoConexao.set({
+    caiuEm: Date.now(),
+    motivo: `${statusCode ?? 'n/d'} (${nomeDoMotivo(statusCode)})${mensagemErro ? ' — ' + mensagemErro : ''}`
+  });
+}
+
+function duracaoLegivel(ms) {
+  const seg = Math.round(ms / 1000);
+  if (seg < 60) return `${seg} segundo(s)`;
+  const min = Math.round(seg / 60);
+  if (min < 60) return `${min} minuto(s)`;
+  const h = Math.floor(min / 60);
+  return `${h}h${String(min % 60).padStart(2, '0')}`;
+}
+
+async function avisarQuedaSeHouver() {
+  const estado = estadoConexao.get();
+  if (!estado.caiuEm) return;
+
+  const duracao = Date.now() - estado.caiuEm;
+  const motivo = estado.motivo;
+  // Limpa antes de tentar enviar: se o envio falhar, é melhor perder um aviso do que ficar com
+  // uma queda velha gravada disparando aviso a cada reconexão pra sempre.
+  estadoConexao.set({ caiuEm: null, motivo: null });
+
+  if (duracao < QUEDA_MINIMA_PRA_AVISAR_MS) {
+    console.log(`[ALERTA] Queda de ${duracaoLegivel(duracao)} — curta demais pra avisar.`);
+    return;
+  }
+  const desdeUltimo = Date.now() - (estado.ultimoAvisoEm || 0);
+  if (desdeUltimo < INTERVALO_MINIMO_ENTRE_AVISOS_MS) {
+    console.log(`[ALERTA] Queda de ${duracaoLegivel(duracao)}, mas já avisei há ${duracaoLegivel(desdeUltimo)} — segurando pra não virar spam.`);
+    return;
+  }
+  if (!NUMERO_ALERTA) return;
+
+  try {
+    // Resolve o JID pelo próprio WhatsApp em vez de montar na mão: número do Brasil tem a
+    // pegadinha do nono dígito, e quem sabe o formato certo da conta é o servidor.
+    let jid = `${NUMERO_ALERTA}@s.whatsapp.net`;
+    try {
+      const achado = await sock.onWhatsApp(NUMERO_ALERTA);
+      if (achado?.[0]?.jid) jid = achado[0].jid;
+      else console.log(`[ALERTA] ${NUMERO_ALERTA} não apareceu no onWhatsApp — tentando o JID montado na mão.`);
+    } catch (err) {
+      console.log('[ALERTA] onWhatsApp falhou, usando JID montado na mão:', err.message);
+    }
+
+    await sock.sendMessage(jid, {
+      text: `⚠️ O moderador ficou fora do ar por ${duracaoLegivel(duracao)} e acabou de voltar.\n\n`
+        + `Motivo da queda: ${motivo}\n`
+        + `Voltou em: ${new Date().toLocaleString('pt-BR', { timeZone: 'America/Sao_Paulo' })}\n\n`
+        + `As mensagens desse período são resgatadas automaticamente, dentro da janela de ${HORAS_RESGATE}h.`
+    });
+    estadoConexao.set({ ultimoAvisoEm: Date.now() });
+    console.log(`[ALERTA] Aviso de queda (${duracaoLegivel(duracao)}) enviado pra ${jid}.`);
+  } catch (err) {
+    console.error('[ALERTA] Não consegui avisar a queda no privado:', err.message);
+  }
+}
+
+function marcarSinalDeVida() {
+  ultimoSinalDeVida = Date.now();
+}
+
+function nomeDoMotivo(statusCode) {
+  const nomes = Object.entries(DisconnectReason).find(([, v]) => v === statusCode);
+  return nomes ? nomes[0] : 'desconhecido';
+}
+
+function esperaDaVez() {
+  const base = ESPERAS_RECONEXAO_MS[Math.min(tentativasReconexao, ESPERAS_RECONEXAO_MS.length - 1)];
+  // Jitter pra não bater no servidor sempre no mesmo instante depois de uma queda geral.
+  return base + Math.floor(Math.random() * 2000);
+}
+
 // Reconexão agendada só vale se ninguém trocou de conta nesse meio-tempo.
 function reconectarSeAindaForAVez(geracao, atraso) {
   setTimeout(() => {
@@ -1797,6 +1972,36 @@ function reconectarSeAindaForAVez(geracao, atraso) {
     }
     connectToWhatsApp().catch((err) => console.error('Erro ao reconectar:', err.message));
   }, atraso);
+}
+
+// Roda uma vez só, independente de quantas reconexões aconteçam.
+function iniciarVigiaDeConexao() {
+  if (vigiaConexaoIniciado) return;
+  vigiaConexaoIniciado = true;
+
+  const SILENCIO_MAXIMO_MS = Number(process.env.SILENCIO_MAXIMO_MS || 10 * 60_000);
+
+  setInterval(async () => {
+    if (!isConnected || trocaEmAndamento || !sock) return;
+
+    const silencio = Date.now() - ultimoSinalDeVida;
+    if (silencio < SILENCIO_MAXIMO_MS) return;
+
+    // Grupo parado é normal, então silêncio sozinho não prova nada. Antes de derrubar, cutuca a
+    // conexão: se ela estiver viva, isto responde e renova o sinal de vida sem efeito nenhum
+    // visível no grupo.
+    try {
+      await sock.sendPresenceUpdate('available');
+      marcarSinalDeVida();
+      return;
+    } catch (err) {
+      console.error(`[VIGIA] Conexão não respondeu após ${Math.round(silencio / 60000)}min de silêncio (${err.message}). Forçando reconexão.`);
+    }
+
+    isConnected = false;
+    try { sock.end(new Error('vigia: conexão sem resposta')); } catch { /* já morto */ }
+    reconectarSeAindaForAVez(geracaoConexao, 1000);
+  }, 60_000);
 }
 
 async function trocarConta(nome) {
@@ -1837,6 +2042,7 @@ async function connectToWhatsApp() {
     persistTopicos.carregar(),
     persistMensagensEnviadas.carregar(),
     marcaDagua.carregar(),
+    estadoConexao.carregar(),
     historicoModeracao.carregar(),
     persistRegras.carregar(),
     configContas.carregar(),
@@ -1906,6 +2112,7 @@ async function connectToWhatsApp() {
     // Evento de um socket de geração anterior: ignora, quem manda agora é outro.
     if (minhaGeracao !== geracaoConexao) return;
 
+    marcarSinalDeVida();
     const { connection, lastDisconnect, qr } = update;
 
     if (qr) {
@@ -1926,9 +2133,22 @@ async function connectToWhatsApp() {
         ? lastDisconnect.error.output?.statusCode
         : undefined;
       const shouldReconnect = statusCode !== DisconnectReason.loggedOut;
-      console.log('Conexão fechada:', lastDisconnect?.error?.message, '| Reconectando:', shouldReconnect);
+
+      // Outra sessão assumiu a conta (abriram o WhatsApp Web com o mesmo número). Reconectar
+      // rápido aqui vira cabo de guerra: as duas sessões derrubam uma à outra em looping. Espera
+      // longa e deixa a outra ponta se resolver.
+      const sessaoSubstituida = statusCode === DisconnectReason.connectionReplaced;
+
+      const atraso = sessaoSubstituida ? 60_000 : esperaDaVez();
+      tentativasReconexao++;
+      registrarQueda(statusCode, lastDisconnect?.error?.message);
+      console.log(
+        `Conexão fechada: ${lastDisconnect?.error?.message || 'sem mensagem'} | motivo=${statusCode ?? 'n/d'} (${nomeDoMotivo(statusCode)})`
+        + ` | reconectar=${shouldReconnect} | tentativa ${tentativasReconexao} em ${Math.round(atraso / 1000)}s`
+      );
+
       if (shouldReconnect) {
-        reconectarSeAindaForAVez(minhaGeracao, 5000);
+        reconectarSeAindaForAVez(minhaGeracao, atraso);
       } else {
         console.log(`Sessão desconectada (logout) — limpando credenciais antigas e reiniciando pra gerar um QR novo.`);
         await limparCredenciaisAntigasDoBaileys();
@@ -1937,8 +2157,16 @@ async function connectToWhatsApp() {
     } else if (connection === 'open') {
       currentQR = null;
       isConnected = true;
+      // Só zera depois de conectar de verdade. Zerar em 'connecting' faria a espera reiniciar do
+      // começo a cada tentativa e o crescimento nunca aconteceria.
+      if (tentativasReconexao > 0) {
+        console.log(`Reconectado após ${tentativasReconexao} tentativa(s).`);
+      }
+      tentativasReconexao = 0;
       console.log('Conectado ao WhatsApp com sucesso.');
       detectarTrocaDeConta();
+      iniciarVigiaDeConexao();
+      avisarQuedaSeHouver().catch((err) => console.error('[ALERTA] Erro no aviso de queda:', err.message));
       if (!tickerDebateIniciado) {
         tickerDebateIniciado = true;
         setInterval(() => verificarCicloDebate().catch((err) => console.error('Erro no verificarCicloDebate:', err.message)), 60_000);
@@ -1947,6 +2175,7 @@ async function connectToWhatsApp() {
   });
 
   sock.ev.on('messages.upsert', async ({ messages, type }) => {
+    marcarSinalDeVida();
     // Fotografa o teto ANTES do lote: dentro de um mesmo lote de sincronização as mensagens
     // podem vir fora de ordem, e comparar contra um teto que sobe a cada item descartaria a
     // mensagem mais antiga do próprio lote.
@@ -2233,6 +2462,20 @@ function extrairTextoDeContainer(conteudo, tipoConteudo) {
         }
       } catch (err) {
         console.error('Erro ao baixar/processar vídeo:', err.message);
+      }
+    } else if (tipo === 'figurinha') {
+      // Faltava este ramo. A figurinha era encaminhada com texto vazio e midia_base64 nulo, ou
+      // seja: a IA recebia uma mensagem sem conteúdo NENHUM e obviamente não achava nada errado.
+      // Figurinha obscena passava batido não por permissividade do modelo, mas porque ninguém
+      // nunca mostrou a imagem pra ele.
+      try {
+        const buffer = await downloadMediaMessage(msg, 'buffer', {}, { logger: pino({ level: 'silent' }), reuploadRequest: sock.updateMediaMessage });
+        const convertida = await figurinhaParaImagem(buffer);
+        midiaBase64 = convertida.base64;
+        midiaMimeType = convertida.mime;
+        console.log(`[FIGURINHA] Imagem anexada pra moderação (${convertida.mime}${conteudo.stickerMessage?.isAnimated ? ', animada' : ''}). id=${msgId}`);
+      } catch (err) {
+        console.error('Erro ao baixar figurinha:', err.message);
       }
     }
 
@@ -2899,6 +3142,14 @@ app.get('/painel', (req, res) => {
             <span class="ticket__detalhe">Última menção geral: ${estado.ultimaMencaoEm ? new Date(estado.ultimaMencaoEm).toLocaleString('pt-BR', { timeZone: FUSO_HORARIO }) : 'nunca'}</span>
             <form method="POST" action="/painel/resetar" onsubmit="return confirm('Resetar? Libera o grupo se estiver preso em enquete/debate, devolve o tópico em andamento pra fila (se houver) e zera a marca de última menção geral, pra poder testar de novo mesmo depois de um ciclo já ter terminado.')">
               <button class="botao-secundario" type="submit">↺ Resetar ciclo (uso em teste)</button>
+            </form>
+            <form method="POST" action="/painel/debate-manual" onsubmit="return confirm('Começar debate com este tema? Isso destranca o grupo e liga a moderação de fora do tema — que CONTA pro banimento. Confira o tema antes.')">
+              <label for="temaManual">Começar debate na mão (quando a apuração falhar)</label>
+              <input id="temaManual" name="tema" type="text" placeholder="Tema vencedor" required>
+              <input name="votos" type="number" min="0" placeholder="Nº de votos (opcional)" title="Quantas pessoas votaram — só entra no texto do anúncio">
+              <input name="horas" type="number" min="0.01" step="0.01" value="${cfg.duracaoDebateHoras}" title="Duração em horas">
+              <label><input name="mencionar" type="checkbox" value="1"> Marcar todo mundo no anúncio (conta pro intervalo de menção geral)</label>
+              <button class="botao-secundario" type="submit">▶ Iniciar debate com este tema</button>
             </form>
           </div>
 
@@ -3766,6 +4017,96 @@ app.post('/painel/topicos/apagar', (req, res) => {
   topicosEnquete.clear();
   persistTopicos.agendarSalvar();
   res.redirect(`/painel?topicosApagados=${quantidade}`);
+});
+
+// Entrar em modo debate SEM depender da apuração da enquete.
+//
+// Existe porque a apuração pode falhar por motivo que não tem conserto — troca da conta do bot no
+// meio da enquete, queda longa que fez o bot perder votos. Quando isso acontece, a contagem está
+// na tela do WhatsApp, visível pro admin, e não está em lugar nenhum que o código alcance. Sem
+// esta rota o único caminho era resetar e perder o ciclo.
+//
+// Importante: isto liga a moderação de fora do tema, que hoje CONTA pro banimento. Tema errado
+// aqui significa apagar e punir quem está falando do assunto certo. O tema vem digitado à mão de
+// propósito — é o admin afirmando qual é, não o código adivinhando.
+app.post('/painel/debate-manual', async (req, res) => {
+  const cfg = configDebate.get();
+  const tema = String(req.body.tema || '').trim();
+  const horas = Number(req.body.horas) || cfg.duracaoDebateHoras || 1;
+
+  if (!tema || !cfg.grupoId) {
+    console.error('[DEBATE MANUAL] Faltou tema ou grupo configurado — nada foi feito.');
+    return res.redirect('/painel?debateManual=erro');
+  }
+
+  if (sock) {
+    // A enquete tranca o grupo em só-admin. Se ela não chegou a fechar, quem destranca é aqui.
+    try {
+      await sock.groupSettingUpdate(cfg.grupoId, 'not_announcement');
+    } catch (err) {
+      console.error('[DEBATE MANUAL] Erro ao destrancar o grupo:', err.message);
+    }
+  }
+
+  estadoDebate.set({
+    fase: 'debate',
+    grupoId: cfg.grupoId,
+    tema,
+    terminaEm: new Date(Date.now() + horas * 3600_000).toISOString(),
+    // Zera o resto da enquete: os votos não servem mais e ficariam sujando a próxima apuração.
+    pollMessageKey: null,
+    votosAcumulados: [],
+    votantesConhecidos: [],
+    pollEncKeyB64: null,
+    pollOpcoesEnviadas: [],
+    pollCreatorCandidatos: [],
+    pollCreatorConfirmado: null
+  });
+
+  console.log(`[DEBATE MANUAL] Debate iniciado pelo painel: "${tema}" por ${horas}h em ${cfg.grupoId}.`);
+
+  if (sock) {
+    try {
+      // A contagem de votos é digitada pelo admin porque ela existe na tela do WhatsApp e não
+      // existe em lugar nenhum que o código alcance quando a apuração falha. Fica opcional: sem
+      // número, o anúncio simplesmente não menciona votação.
+      const votos = parseInt(req.body.votos, 10);
+      const abertura = Number.isFinite(votos) && votos > 0
+        ? `✅ ${votos} ${votos === 1 ? 'pessoa votou' : 'pessoas votaram'} — o tema mais votado foi *${tema}*.`
+        : `💬 O debate de hoje é sobre *${tema}*.`;
+
+      // Menção geral só se o admin pedir na marca. E quando pede, GRAVA `ultimaMencaoEm` — assim
+      // esta menção entra no mesmo contador que o ciclo automático consulta, em vez de virar uma
+      // porta lateral que fura o intervalo configurado no painel.
+      let jidsParaMencionar = [];
+      if (req.body.mencionar) {
+        try {
+          const metadata = await sock.groupMetadata(cfg.grupoId);
+          jidsParaMencionar = metadata.participants.map((p) => p.id);
+        } catch (err) {
+          console.error('[DEBATE MANUAL] Não consegui buscar participantes pra mencionar — anunciando sem menção:', err.message);
+        }
+      }
+      const blocoMencoes = jidsParaMencionar.length > 0
+        ? `\n\n${jidsParaMencionar.map((jid) => `@${jid.split('@')[0]}`).join(' ')}`
+        : '';
+
+      await enviarComDigitando(
+        cfg.grupoId,
+        `${abertura} O debate começa agora e vai durar ${horas}h — vamos manter o papo no tema!${blocoMencoes}`,
+        jidsParaMencionar
+      );
+
+      if (jidsParaMencionar.length > 0) {
+        estadoDebate.set({ ultimaMencaoEm: new Date().toISOString() });
+        console.log(`[DEBATE MANUAL] ${jidsParaMencionar.length} participante(s) mencionado(s). ultimaMencaoEm atualizado.`);
+      }
+    } catch (err) {
+      console.error('[DEBATE MANUAL] Erro ao anunciar no grupo:', err.message);
+    }
+  }
+
+  res.redirect('/painel?debateManual=1');
 });
 
 app.post('/painel/resetar', async (req, res) => {
