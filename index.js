@@ -1270,12 +1270,39 @@ let currentQR = null;
 let isConnected = false;
 let tickerDebateIniciado = false;
 
+// Guarda o que o bot mandou, pra poder REENVIAR quando o aparelho de alguém não conseguir
+// decriptar. Quando isso acontece, o celular do destinatário pede a mensagem de volta e o Baileys
+// chama getMessage() pra reencriptar e mandar de novo. Se getMessage devolver undefined, não há
+// reenvio: a mensagem congela em "Aguardando mensagem. Essa ação pode levar alguns instantes"
+// PARA SEMPRE, e nada no bot indica erro — do lado dele o envio foi um sucesso.
+//
+// Antes, só a enquete era guardada (linha do pollMsg). Todo aviso, anúncio e alerta ficava de
+// fora, então todo texto do bot era irrecuperável. Sessão nova, com as chaves ainda assentando,
+// é justamente quando mais se pede reenvio — que é o caso de um número pareado hoje.
+function guardarMensagemEnviada(mensagemEnviada) {
+  try {
+    if (!mensagemEnviada?.key?.id || !mensagemEnviada?.message) return;
+    persistMensagensEnviadas.mapa.set(
+      `${mensagemEnviada.key.remoteJid}:${mensagemEnviada.key.id}`,
+      mensagemEnviada.message
+    );
+    // Teto pra não crescer sem fim: pedido de reenvio chega em minutos, não em dias.
+    while (persistMensagensEnviadas.mapa.size > 300) {
+      persistMensagensEnviadas.mapa.delete(persistMensagensEnviadas.mapa.keys().next().value);
+    }
+    persistMensagensEnviadas.agendarSalvar();
+  } catch (err) {
+    console.error('Erro ao guardar mensagem enviada pra reenvio:', err.message);
+  }
+}
+
 async function enviarComDigitando(jid, texto, mentions = []) {
   try {
     await sock.sendPresenceUpdate('composing', jid);
     await new Promise((resolve) => setTimeout(resolve, 1200 + Math.random() * 1300));
     const mensagemEnviada = await sock.sendMessage(jid, mentions.length > 0 ? { text: texto, mentions } : { text: texto });
     await sock.sendPresenceUpdate('paused', jid);
+    guardarMensagemEnviada(mensagemEnviada);
     return mensagemEnviada;
   } catch (err) {
     console.error('Erro ao enviar mensagem com efeito de digitação:', err.message);
@@ -1358,8 +1385,7 @@ async function iniciarCicloDebate() {
     const pollMsg = await sock.sendMessage(cfg.grupoId, {
       poll: { name: topico.tema, values: topico.opcoes, selectableCount: 1 }
     });
-    persistMensagensEnviadas.mapa.set(`${pollMsg.key.remoteJid}:${pollMsg.key.id}`, pollMsg.message);
-    persistMensagensEnviadas.agendarSalvar();
+    guardarMensagemEnviada(pollMsg);
 
     // --- Contexto de decriptação, capturado agora, com tudo fresco ---
     const conteudoEnquete = pollMsg.message?.pollCreationMessage
@@ -1935,12 +1961,13 @@ async function avisarQuedaSeHouver() {
       console.log('[ALERTA] onWhatsApp falhou, usando JID montado na mão:', err.message);
     }
 
-    await sock.sendMessage(jid, {
+    const avisoEnviado = await sock.sendMessage(jid, {
       text: `⚠️ O moderador ficou fora do ar por ${duracaoLegivel(duracao)} e acabou de voltar.\n\n`
         + `Motivo da queda: ${motivo}\n`
         + `Voltou em: ${new Date().toLocaleString('pt-BR', { timeZone: 'America/Sao_Paulo' })}\n\n`
         + `As mensagens desse período são resgatadas automaticamente, dentro da janela de ${HORAS_RESGATE}h.`
     });
+    guardarMensagemEnviada(avisoEnviado);
     estadoConexao.set({ ultimoAvisoEm: Date.now() });
     console.log(`[ALERTA] Aviso de queda (${duracaoLegivel(duracao)}) enviado pra ${jid}.`);
   } catch (err) {
