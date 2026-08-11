@@ -3192,7 +3192,11 @@ app.get('/painel', (req, res) => {
             ${estado.tema ? `<span class="ticket__detalhe">Tema: ${escapeHtml(estado.tema)}</span>` : ''}
             ${estado.terminaEm ? `<span class="ticket__detalhe">Termina em ${new Date(estado.terminaEm).toLocaleString('pt-BR', { timeZone: FUSO_HORARIO })}</span>` : ''}
             ${estado.fase === 'normal' && estado.proximoDisparoEm ? `<span class="ticket__detalhe">Próxima enquete em ${new Date(estado.proximoDisparoEm).toLocaleString('pt-BR', { timeZone: FUSO_HORARIO })}</span>` : ''}
-            <span class="ticket__detalhe">Última menção geral: ${estado.ultimaMencaoEm ? new Date(estado.ultimaMencaoEm).toLocaleString('pt-BR', { timeZone: FUSO_HORARIO }) : 'nunca'}</span>
+            <span class="ticket__detalhe">Última menção geral: ${estado.ultimaMencaoEm ? new Date(estado.ultimaMencaoEm).toLocaleString('pt-BR', { timeZone: FUSO_HORARIO }) : 'nunca — o próximo ciclo vai mencionar'}</span>
+            ${estado.ultimaMencaoEm ? `<span class="ticket__detalhe">Menciona de novo a partir de ${new Date(new Date(estado.ultimaMencaoEm).getTime() + cfg.intervaloDiasMencao * 86400000).toLocaleDateString('pt-BR', { timeZone: FUSO_HORARIO })}</span>` : ''}
+            <form method="POST" action="/painel/adiar-mencao">
+              <button class="botao-secundario" type="submit">🔕 Contar o intervalo a partir de hoje</button>
+            </form>
             <form method="POST" action="/painel/resetar" onsubmit="return confirm('Resetar? Libera o grupo se estiver preso em enquete/debate, devolve o tópico em andamento pra fila (se houver) e zera a marca de última menção geral, pra poder testar de novo mesmo depois de um ciclo já ter terminado.')">
               <button class="botao-secundario" type="submit">↺ Resetar ciclo (uso em teste)</button>
             </form>
@@ -4135,6 +4139,19 @@ app.post('/painel/topicos/apagar', (req, res) => {
 // Apagar só o arquivo daquele contato obriga o Baileys a negociar tudo de novo com ele no próximo
 // envio, e não afeta mais ninguém. O creds.json fica intacto, então NÃO pede QR e nenhuma outra
 // sessão do grupo é perdida — é o oposto do logout, que apaga tudo e troca a identidade.
+// Marca a menção geral como se tivesse acontecido agora, sem mencionar ninguém.
+//
+// Serve pra duas situações que dão no mesmo: pular a menção do próximo ciclo, e fazer o intervalo
+// começar a contar de hoje. Faz falta porque `ultimaMencaoEm` nasce nulo, e nulo é tratado como
+// "infinitos dias sem mencionar" — então o primeiro ciclo depois de configurar SEMPRE menciona
+// todo mundo, por mais alto que esteja o intervalo. Era o que não dava pra evitar antes.
+app.post('/painel/adiar-mencao', (req, res) => {
+  estadoDebate.set({ ultimaMencaoEm: new Date().toISOString() });
+  const cfg = configDebate.get();
+  console.log(`[MENÇÃO] Contador zerado a partir de agora — próxima menção geral só depois de ${cfg.intervaloDiasMencao} dia(s).`);
+  res.redirect('/painel?mencao=adiada');
+});
+
 app.post('/painel/resetar-sessao', async (req, res) => {
   const alvo = String(req.body.numero || '').replace(/\D/g, '');
   const pasta = pastaDaConta(configContas.get().ativa);
