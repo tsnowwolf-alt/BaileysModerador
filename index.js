@@ -248,10 +248,22 @@ function dataLocalISO(data = new Date()) {
 // Calcula o PRÓXIMO horário de disparo uma vez só (olhando até 7 dias à frente), em vez de
 // redescobrir "que dia é hoje" a cada minuto pra sempre. São Paulo não observa horário de verão
 // desde 2019, então o offset -03:00 é fixo e seguro de usar direto na string ISO.
-function calcularProximoDisparo(cfg, apartirDe = new Date()) {
+// Calcula quando a próxima enquete deve sair.
+//
+// O `ultimoCicloIniciadoEm` existe desde sempre no estado, mas nunca era consultado aqui — e essa
+// era a falha. Sem ele, a conta é só "próxima vez que o horário configurado acontece depois de
+// agora". Então salvar a configuração de manhã, com um horário ainda à frente no mesmo dia,
+// agendava uma SEGUNDA enquete pro mesmo dia. Foi o que aconteceu: 09:02 e depois 09:17.
+//
+// O painel promete "o ciclo roda todo dia", no singular. Agora o código cumpre isso: dia que já
+// teve ciclo é pulado, independente de quantas vezes a configuração for salva.
+function calcularProximoDisparo(cfg, apartirDe = new Date(), ultimoCicloIniciadoEm = null) {
+  const diaDoUltimoCiclo = ultimoCicloIniciadoEm ? dataLocalISO(new Date(ultimoCicloIniciadoEm)) : null;
+
   for (let diasAFrente = 0; diasAFrente <= 7; diasAFrente++) {
     const candidatoBase = new Date(apartirDe.getTime() + diasAFrente * 86_400_000);
     const dataISO = dataLocalISO(candidatoBase);
+    if (dataISO === diaDoUltimoCiclo) continue; // esse dia já teve a enquete dele
     const horarioAlvo = éDiaDeSemana(candidatoBase) ? cfg.horarioSemana : cfg.horario;
     const alvo = new Date(`${dataISO}T${horarioAlvo}:00-03:00`);
     if (alvo.getTime() > apartirDe.getTime()) return alvo;
@@ -870,7 +882,7 @@ function atualizarProximoDisparo() {
     estadoDebate.set({ proximoDisparoEm: null });
     return;
   }
-  const proximo = calcularProximoDisparo(cfg, new Date());
+  const proximo = calcularProximoDisparo(cfg, new Date(), estadoDebate.get().ultimoCicloIniciadoEm);
   estadoDebate.set({ proximoDisparoEm: proximo ? proximo.toISOString() : null });
 }
 
@@ -3192,7 +3204,11 @@ app.get('/painel', (req, res) => {
             ${estado.tema ? `<span class="ticket__detalhe">Tema: ${escapeHtml(estado.tema)}</span>` : ''}
             ${estado.terminaEm ? `<span class="ticket__detalhe">Termina em ${new Date(estado.terminaEm).toLocaleString('pt-BR', { timeZone: FUSO_HORARIO })}</span>` : ''}
             ${estado.fase === 'normal' && estado.proximoDisparoEm ? `<span class="ticket__detalhe">Próxima enquete em ${new Date(estado.proximoDisparoEm).toLocaleString('pt-BR', { timeZone: FUSO_HORARIO })}</span>` : ''}
-            <span class="ticket__detalhe">Última menção geral: ${estado.ultimaMencaoEm ? new Date(estado.ultimaMencaoEm).toLocaleString('pt-BR', { timeZone: FUSO_HORARIO }) : 'nunca'}</span>
+            <span class="ticket__detalhe">Última menção geral: ${estado.ultimaMencaoEm ? new Date(estado.ultimaMencaoEm).toLocaleString('pt-BR', { timeZone: FUSO_HORARIO }) : 'nunca — o próximo ciclo vai mencionar'}</span>
+            ${estado.ultimaMencaoEm ? `<span class="ticket__detalhe">Menciona de novo a partir de ${new Date(new Date(estado.ultimaMencaoEm).getTime() + cfg.intervaloDiasMencao * 86400000).toLocaleDateString('pt-BR', { timeZone: FUSO_HORARIO })}</span>` : ''}
+            <form method="POST" action="/painel/adiar-mencao">
+              <button class="botao-secundario" type="submit">🔕 Contar o intervalo a partir de hoje</button>
+            </form>
             <form method="POST" action="/painel/resetar" onsubmit="return confirm('Resetar? Libera o grupo se estiver preso em enquete/debate, devolve o tópico em andamento pra fila (se houver) e zera a marca de última menção geral, pra poder testar de novo mesmo depois de um ciclo já ter terminado.')">
               <button class="botao-secundario" type="submit">↺ Resetar ciclo (uso em teste)</button>
             </form>
@@ -4135,6 +4151,19 @@ app.post('/painel/topicos/apagar', (req, res) => {
 // Apagar só o arquivo daquele contato obriga o Baileys a negociar tudo de novo com ele no próximo
 // envio, e não afeta mais ninguém. O creds.json fica intacto, então NÃO pede QR e nenhuma outra
 // sessão do grupo é perdida — é o oposto do logout, que apaga tudo e troca a identidade.
+// Marca a menção geral como se tivesse acontecido agora, sem mencionar ninguém.
+//
+// Serve pra duas situações que dão no mesmo: pular a menção do próximo ciclo, e fazer o intervalo
+// começar a contar de hoje. Faz falta porque `ultimaMencaoEm` nasce nulo, e nulo é tratado como
+// "infinitos dias sem mencionar" — então o primeiro ciclo depois de configurar SEMPRE menciona
+// todo mundo, por mais alto que esteja o intervalo. Era o que não dava pra evitar antes.
+app.post('/painel/adiar-mencao', (req, res) => {
+  estadoDebate.set({ ultimaMencaoEm: new Date().toISOString() });
+  const cfg = configDebate.get();
+  console.log(`[MENÇÃO] Contador zerado a partir de agora — próxima menção geral só depois de ${cfg.intervaloDiasMencao} dia(s).`);
+  res.redirect('/painel?mencao=adiada');
+});
+
 app.post('/painel/resetar-sessao', async (req, res) => {
   const alvo = String(req.body.numero || '').replace(/\D/g, '');
   const pasta = pastaDaConta(configContas.get().ativa);
@@ -4307,7 +4336,9 @@ app.post('/painel/resetar', async (req, res) => {
     pollOpcoesEnviadas: [],
     pollCreatorCandidatos: [],
     topicoId: null,
-    ultimaMencaoEm: null
+    ultimaMencaoEm: null,
+    // Limpa a marca de "já rodou hoje" — é justamente o que o reset serve pra permitir.
+    ultimoCicloIniciadoEm: null
   });
   atualizarProximoDisparo();
 
