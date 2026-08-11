@@ -3183,6 +3183,9 @@ app.get('/painel', (req, res) => {
             <form method="POST" action="/painel/resetar" onsubmit="return confirm('Resetar? Libera o grupo se estiver preso em enquete/debate, devolve o tópico em andamento pra fila (se houver) e zera a marca de última menção geral, pra poder testar de novo mesmo depois de um ciclo já ter terminado.')">
               <button class="botao-secundario" type="submit">↺ Resetar ciclo (uso em teste)</button>
             </form>
+            <form method="POST" action="/painel/testar-entrega">
+              <button class="botao-secundario" type="submit">✉ Testar entrega no meu privado</button>
+            </form>
           </div>
 
           <section class="cartao">
@@ -4088,6 +4091,41 @@ app.post('/painel/topicos/apagar', (req, res) => {
 // Importante: isto liga a moderação de fora do tema, que hoje CONTA pro banimento. Tema errado
 // aqui significa apagar e punir quem está falando do assunto certo. O tema vem digitado à mão de
 // propósito — é o admin afirmando qual é, não o código adivinhando.
+// Manda uma mensagem no privado do admin. Serve pra duas coisas ao mesmo tempo:
+//
+// 1. TESTAR ENTREGA sem depender de alguém violar regra no grupo. Se chegar legível, o caminho
+//    de texto do bot está inteiro; se chegar como "Aguardando mensagem", não está.
+// 2. CONSERTAR a sessão. Quando o aparelho do admin tem sessão quebrada com o bot — o que
+//    acontece depois de trocar de número ou deslogar, porque a identidade criptográfica muda —
+//    a chave de grupo não chega nele e os avisos ficam ilegíveis SÓ pra ele. Uma troca no
+//    privado obriga os dois lados a refazerem a sessão par a par, e aí o grupo volta a
+//    renderizar. É o único caminho que reconstrói esse par: apagar conversa não resolve.
+app.post('/painel/testar-entrega', async (req, res) => {
+  if (!sock || !NUMERO_ALERTA) return res.redirect('/painel?entrega=erro');
+
+  try {
+    let jid = `${NUMERO_ALERTA}@s.whatsapp.net`;
+    try {
+      const achado = await sock.onWhatsApp(NUMERO_ALERTA);
+      if (achado?.[0]?.jid) jid = achado[0].jid;
+    } catch (err) {
+      console.log('[TESTE ENTREGA] onWhatsApp falhou, usando JID montado na mão:', err.message);
+    }
+
+    const enviada = await sock.sendMessage(jid, {
+      text: `🔧 Teste de entrega — ${new Date().toLocaleString('pt-BR', { timeZone: FUSO_HORARIO })}.\n\n`
+        + `Se você está lendo isto, o texto do bot chega normalmente no seu aparelho.\n`
+        + `Se apareceu "Aguardando mensagem", responda esta conversa com qualquer coisa: a troca no privado refaz a sessão e destrava os avisos no grupo.`
+    });
+    guardarMensagemEnviada(enviada);
+    console.log(`[TESTE ENTREGA] Mensagem enviada pra ${jid}.`);
+    res.redirect('/painel?entrega=1');
+  } catch (err) {
+    console.error('[TESTE ENTREGA] Falhou:', err.message);
+    res.redirect('/painel?entrega=erro');
+  }
+});
+
 app.post('/painel/debate-manual', async (req, res) => {
   const cfg = configDebate.get();
   const tema = String(req.body.tema || '').trim();
