@@ -3129,6 +3129,10 @@ app.get('/painel', (req, res) => {
     .grade-campos { display: grid; grid-template-columns: repeat(auto-fit, minmax(210px, 1fr)); gap: 14px 16px; }
     .campo { display: flex; flex-direction: column; gap: 6px; }
     .campo--largo { grid-column: 1 / -1; }
+    .campo__dica { font-weight: 400; color: var(--apagado); }
+    .caixinha { display: flex; gap: 10px; align-items: flex-start; margin: 16px 0 4px; font-size: 13.5px; line-height: 1.45; cursor: pointer; }
+    .caixinha input { margin-top: 2px; width: 17px; height: 17px; flex: none; accent-color: var(--dourado); }
+    .caixinha small { display: block; font-weight: 400; color: var(--apagado); font-size: 12.5px; }
     .campo label { font-size: 13px; font-weight: 500; }
     .campo input { font: inherit; font-size: 15px; padding: 10px 12px; border: 1px solid var(--linha); border-radius: 8px; background: var(--papel); color: var(--tinta); width: 100%; }
     .campo input:focus-visible { outline: 2px solid var(--dourado); outline-offset: 1px; background: var(--superficie); }
@@ -3170,15 +3174,34 @@ app.get('/painel', (req, res) => {
             <form method="POST" action="/painel/resetar" onsubmit="return confirm('Resetar? Libera o grupo se estiver preso em enquete/debate, devolve o tópico em andamento pra fila (se houver) e zera a marca de última menção geral, pra poder testar de novo mesmo depois de um ciclo já ter terminado.')">
               <button class="botao-secundario" type="submit">↺ Resetar ciclo (uso em teste)</button>
             </form>
-            <form method="POST" action="/painel/debate-manual" onsubmit="return confirm('Começar debate com este tema? Isso destranca o grupo e liga a moderação de fora do tema — que CONTA pro banimento. Confira o tema antes.')">
-              <label for="temaManual">Começar debate na mão (quando a apuração falhar)</label>
-              <input id="temaManual" name="tema" type="text" placeholder="Tema vencedor" required>
-              <input name="votos" type="number" min="0" placeholder="Nº de votos (opcional)" title="Quantas pessoas votaram — só entra no texto do anúncio">
-              <input name="horas" type="number" min="0.01" step="0.01" value="${cfg.duracaoDebateHoras}" title="Duração em horas">
-              <label><input name="mencionar" type="checkbox" value="1"> Marcar todo mundo no anúncio (conta pro intervalo de menção geral)</label>
-              <button class="botao-secundario" type="submit">▶ Iniciar debate com este tema</button>
-            </form>
           </div>
+
+          <section class="cartao">
+            <p class="cartao__olho">Plano B</p>
+            <h2>Começar debate na mão</h2>
+            <p class="cartao__legenda">Pra quando a apuração falhar — troca de número no meio da enquete, queda longa. Você lê a contagem na tela do WhatsApp e informa aqui. Isso destranca o grupo, liga a moderação de fora do tema e anuncia.</p>
+            <form method="POST" action="/painel/debate-manual" onsubmit="return confirm('Começar debate com este tema? Fora do tema conta pro banimento — confira o tema antes.')">
+              <div class="grade-campos">
+                <div class="campo campo--largo">
+                  <label for="temaManual">Tema vencedor</label>
+                  <input id="temaManual" name="tema" type="text" placeholder="Ex: É possível ser feliz sozinho?" required>
+                </div>
+                <div class="campo">
+                  <label for="votosManual">Nº de votos <span class="campo__dica">(opcional)</span></label>
+                  <input id="votosManual" name="votos" type="number" min="0" placeholder="Ex: 14">
+                </div>
+                <div class="campo">
+                  <label for="horasManual">Duração (h)</label>
+                  <input id="horasManual" name="horas" type="number" min="0.01" step="0.01" value="${cfg.duracaoDebateHoras}">
+                </div>
+              </div>
+              <label class="caixinha">
+                <input name="mencionar" type="checkbox" value="1">
+                <span>Marcar todo mundo no anúncio <small>conta pro intervalo de menção geral</small></span>
+              </label>
+              <button class="botao" type="submit">▶ Iniciar debate com este tema</button>
+            </form>
+          </section>
 
           ${bannerImportacao}
           ${bannerReset}
