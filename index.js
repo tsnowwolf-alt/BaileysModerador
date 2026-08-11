@@ -1300,6 +1300,10 @@ function guardarMensagemEnviada(mensagemEnviada) {
       persistMensagensEnviadas.mapa.delete(persistMensagensEnviadas.mapa.keys().next().value);
     }
     persistMensagensEnviadas.agendarSalvar();
+    // O id sai no log pra dar pra cruzar com as linhas de [REENVIO]. Sem ele não dá pra saber se
+    // um pedido que não achou é de mensagem velha (anterior ao conserto) ou se o pedido chegou
+    // antes de eu guardar — são causas diferentes, com consertos diferentes.
+    console.log(`[ENVIO] id=${mensagemEnviada.key.id} guardada pra reenvio (${persistMensagensEnviadas.mapa.size} no cache).`);
   } catch (err) {
     console.error('Erro ao guardar mensagem enviada pra reenvio:', err.message);
   }
