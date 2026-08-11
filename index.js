@@ -3148,6 +3148,10 @@ app.get('/painel', (req, res) => {
     .campo { display: flex; flex-direction: column; gap: 6px; }
     .campo--largo { grid-column: 1 / -1; }
     .campo__dica { font-weight: 400; color: var(--apagado); }
+    .diagnostico { margin-top: 26px; border-top: 1px solid var(--linha); padding-top: 14px; }
+    .diagnostico summary { cursor: pointer; font-size: 13px; color: var(--apagado); letter-spacing: .04em; text-transform: uppercase; }
+    .diagnostico summary::marker { color: var(--apagado); }
+    .diagnostico form { margin-top: 12px; }
     .caixinha { display: flex; gap: 10px; align-items: flex-start; margin: 16px 0 4px; font-size: 13.5px; line-height: 1.45; cursor: pointer; }
     .caixinha input { margin-top: 2px; width: 17px; height: 17px; flex: none; accent-color: var(--dourado); }
     .caixinha small { display: block; font-weight: 400; color: var(--apagado); font-size: 12.5px; }
@@ -3192,13 +3196,6 @@ app.get('/painel', (req, res) => {
             <form method="POST" action="/painel/resetar" onsubmit="return confirm('Resetar? Libera o grupo se estiver preso em enquete/debate, devolve o tópico em andamento pra fila (se houver) e zera a marca de última menção geral, pra poder testar de novo mesmo depois de um ciclo já ter terminado.')">
               <button class="botao-secundario" type="submit">↺ Resetar ciclo (uso em teste)</button>
             </form>
-            <form method="POST" action="/painel/testar-entrega">
-              <button class="botao-secundario" type="submit">✉ Testar entrega no meu privado</button>
-            </form>
-            <form method="POST" action="/painel/resetar-sessao" onsubmit="return confirm('Apagar a sessão criptográfica deste contato? Não pede QR e não afeta ninguém mais — o bot só refaz a negociação com ele no próximo envio.')">
-              <input name="numero" type="text" inputmode="numeric" placeholder="Nº com DDI, ex: 5511986694787" value="${NUMERO_ALERTA}">
-              <button class="botao-secundario" type="submit">🔑 Refazer sessão deste número</button>
-            </form>
           </div>
 
           <section class="cartao">
@@ -3227,6 +3224,21 @@ app.get('/painel', (req, res) => {
               <button class="botao" type="submit">▶ Iniciar debate com este tema</button>
             </form>
           </section>
+
+          <details class="diagnostico">
+            <summary>Diagnóstico de entrega</summary>
+            <p class="cartao__legenda">Só serve quando o bot manda mensagem e alguém vê "Aguardando mensagem" no lugar do texto. Fora disso, não precisa abrir.</p>
+            <form method="POST" action="/painel/testar-entrega">
+              <button class="botao-secundario" type="submit">✉ Testar entrega no meu privado</button>
+            </form>
+            <form method="POST" action="/painel/resetar-sessao" onsubmit="return confirm('Apagar a sessão criptográfica deste contato? Não pede QR e não afeta ninguém mais — o bot só refaz a negociação com ele no próximo envio.')">
+              <div class="campo">
+                <label for="numeroSessao">Refazer a sessão deste número</label>
+                <input id="numeroSessao" name="numero" type="text" inputmode="numeric" placeholder="Nº com DDI, ex: 5511986694787" value="${NUMERO_ALERTA}">
+              </div>
+              <button class="botao-secundario" type="submit">🔑 Refazer sessão</button>
+            </form>
+          </details>
 
           ${bannerImportacao}
           ${bannerReset}
