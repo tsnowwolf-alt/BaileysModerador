@@ -248,10 +248,22 @@ function dataLocalISO(data = new Date()) {
 // Calcula o PRÓXIMO horário de disparo uma vez só (olhando até 7 dias à frente), em vez de
 // redescobrir "que dia é hoje" a cada minuto pra sempre. São Paulo não observa horário de verão
 // desde 2019, então o offset -03:00 é fixo e seguro de usar direto na string ISO.
-function calcularProximoDisparo(cfg, apartirDe = new Date()) {
+// Calcula quando a próxima enquete deve sair.
+//
+// O `ultimoCicloIniciadoEm` existe desde sempre no estado, mas nunca era consultado aqui — e essa
+// era a falha. Sem ele, a conta é só "próxima vez que o horário configurado acontece depois de
+// agora". Então salvar a configuração de manhã, com um horário ainda à frente no mesmo dia,
+// agendava uma SEGUNDA enquete pro mesmo dia. Foi o que aconteceu: 09:02 e depois 09:17.
+//
+// O painel promete "o ciclo roda todo dia", no singular. Agora o código cumpre isso: dia que já
+// teve ciclo é pulado, independente de quantas vezes a configuração for salva.
+function calcularProximoDisparo(cfg, apartirDe = new Date(), ultimoCicloIniciadoEm = null) {
+  const diaDoUltimoCiclo = ultimoCicloIniciadoEm ? dataLocalISO(new Date(ultimoCicloIniciadoEm)) : null;
+
   for (let diasAFrente = 0; diasAFrente <= 7; diasAFrente++) {
     const candidatoBase = new Date(apartirDe.getTime() + diasAFrente * 86_400_000);
     const dataISO = dataLocalISO(candidatoBase);
+    if (dataISO === diaDoUltimoCiclo) continue; // esse dia já teve a enquete dele
     const horarioAlvo = éDiaDeSemana(candidatoBase) ? cfg.horarioSemana : cfg.horario;
     const alvo = new Date(`${dataISO}T${horarioAlvo}:00-03:00`);
     if (alvo.getTime() > apartirDe.getTime()) return alvo;
@@ -870,7 +882,7 @@ function atualizarProximoDisparo() {
     estadoDebate.set({ proximoDisparoEm: null });
     return;
   }
-  const proximo = calcularProximoDisparo(cfg, new Date());
+  const proximo = calcularProximoDisparo(cfg, new Date(), estadoDebate.get().ultimoCicloIniciadoEm);
   estadoDebate.set({ proximoDisparoEm: proximo ? proximo.toISOString() : null });
 }
 
@@ -4324,7 +4336,9 @@ app.post('/painel/resetar', async (req, res) => {
     pollOpcoesEnviadas: [],
     pollCreatorCandidatos: [],
     topicoId: null,
-    ultimaMencaoEm: null
+    ultimaMencaoEm: null,
+    // Limpa a marca de "já rodou hoje" — é justamente o que o reset serve pra permitir.
+    ultimoCicloIniciadoEm: null
   });
   atualizarProximoDisparo();
 
