@@ -1111,7 +1111,16 @@ function timestampDaMensagem(msg) {
 
 async function getMessage(key) {
   const registro = persistMensagensEnviadas.mapa.get(`${key.remoteJid}:${key.id}`);
-  if (!registro) return undefined;
+  // Este log é o único jeito de ver o pedido de reenvio acontecendo. O Baileys chama getMessage
+  // quando o aparelho de alguém não decriptou e pediu a mensagem de volta. Achou = reenvia e o
+  // "Aguardando mensagem" some. Não achou = a mensagem congela naquele estado pra sempre, e sem
+  // esta linha isso acontece em silêncio absoluto.
+  if (registro) {
+    console.log(`[REENVIO] Mensagem ${key.id} pedida de volta e encontrada no cache — reenviando.`);
+  } else {
+    console.log(`[REENVIO] Mensagem ${key.id} pedida de volta e NÃO estava no cache (${persistMensagensEnviadas.mapa.size} guardada(s)) — vai ficar em "Aguardando mensagem".`);
+    return undefined;
+  }
   // Garante que o messageSecret volte como Buffer real para o Baileys não descartar atualizações de enquete após restart
   if (registro.messageContextInfo?.messageSecret) {
     registro.messageContextInfo.messageSecret = garantirBuffer(registro.messageContextInfo.messageSecret);
