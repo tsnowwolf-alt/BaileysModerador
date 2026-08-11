@@ -3190,6 +3190,10 @@ app.get('/painel', (req, res) => {
             <form method="POST" action="/painel/testar-entrega">
               <button class="botao-secundario" type="submit">✉ Testar entrega no meu privado</button>
             </form>
+            <form method="POST" action="/painel/resetar-sessao" onsubmit="return confirm('Apagar a sessão criptográfica deste contato? Não pede QR e não afeta ninguém mais — o bot só refaz a negociação com ele no próximo envio.')">
+              <input name="numero" type="text" inputmode="numeric" placeholder="Nº com DDI, ex: 5511986694787" value="${NUMERO_ALERTA}">
+              <button class="botao-secundario" type="submit">🔑 Refazer sessão deste número</button>
+            </form>
           </div>
 
           <section class="cartao">
@@ -4104,6 +4108,49 @@ app.post('/painel/topicos/apagar', (req, res) => {
 //    a chave de grupo não chega nele e os avisos ficam ilegíveis SÓ pra ele. Uma troca no
 //    privado obriga os dois lados a refazerem a sessão par a par, e aí o grupo volta a
 //    renderizar. É o único caminho que reconstrói esse par: apagar conversa não resolve.
+// Apaga a SESSÃO de um contato específico, sem tocar nas credenciais do bot.
+//
+// Existe porque reenviar não resolve sessão corrompida: o reenvio sai cifrado com a mesma sessão
+// quebrada e chega ilegível de novo. Foi o que aconteceu — três mensagens foram reenviadas com
+// sucesso pelo bot e continuaram em "Aguardando mensagem" no aparelho do admin.
+//
+// O Signal guarda uma sessão por destinatário, em arquivo separado dentro da pasta da conta.
+// Apagar só o arquivo daquele contato obriga o Baileys a negociar tudo de novo com ele no próximo
+// envio, e não afeta mais ninguém. O creds.json fica intacto, então NÃO pede QR e nenhuma outra
+// sessão do grupo é perdida — é o oposto do logout, que apaga tudo e troca a identidade.
+app.post('/painel/resetar-sessao', async (req, res) => {
+  const alvo = String(req.body.numero || '').replace(/\D/g, '');
+  const pasta = pastaDaConta(configContas.get().ativa);
+  if (!alvo || !pasta) return res.redirect('/painel?sessao=erro');
+
+  try {
+    const arquivos = await readdir(pasta).catch(() => []);
+    // Nome de arquivo de sessão inclui o identificador do destinatário. Casa por número e também
+    // por @lid, porque a mesma pessoa aparece nas duas formas neste ambiente.
+    const lids = [...contatosVistos.entries()]
+      .filter(([, info]) => (info?.numero || '').replace(/\D/g, '') === alvo)
+      .map(([jid]) => jid.split('@')[0]);
+    const pedacos = [alvo, ...lids];
+
+    const alvos = arquivos.filter((nome) =>
+      nome.startsWith('session-') && pedacos.some((p) => p && nome.includes(p))
+    );
+
+    for (const nome of alvos) {
+      await unlink(path.join(pasta, nome)).catch(() => {});
+    }
+
+    console.log(`[SESSÃO] ${alvos.length} arquivo(s) de sessão apagado(s) para ${alvo}${lids.length ? ` (lids: ${lids.join(', ')})` : ''}. Credenciais intactas.`);
+    if (alvos.length === 0) {
+      console.log(`[SESSÃO] Nenhum arquivo casou. Existentes: ${arquivos.filter((n) => n.startsWith('session-')).join(', ') || 'nenhum'}`);
+    }
+    res.redirect(`/painel?sessao=${alvos.length}`);
+  } catch (err) {
+    console.error('[SESSÃO] Falhou:', err.message);
+    res.redirect('/painel?sessao=erro');
+  }
+});
+
 app.post('/painel/testar-entrega', async (req, res) => {
   if (!sock || !NUMERO_ALERTA) return res.redirect('/painel?entrega=erro');
 
