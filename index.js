@@ -1110,7 +1110,9 @@ function timestampDaMensagem(msg) {
 }
 
 async function getMessage(key) {
-  const registro = persistMensagensEnviadas.mapa.get(`${key.remoteJid}:${key.id}`);
+  // Busca pelo id puro; a chave composta é só pra achar o que ficou gravado no formato antigo.
+  const registro = persistMensagensEnviadas.mapa.get(key.id)
+    || persistMensagensEnviadas.mapa.get(`${key.remoteJid}:${key.id}`);
   // Este log é o único jeito de ver o pedido de reenvio acontecendo. O Baileys chama getMessage
   // quando o aparelho de alguém não decriptou e pediu a mensagem de volta. Achou = reenvia e o
   // "Aguardando mensagem" some. Não achou = a mensagem congela naquele estado pra sempre, e sem
@@ -1291,10 +1293,13 @@ let tickerDebateIniciado = false;
 function guardarMensagemEnviada(mensagemEnviada) {
   try {
     if (!mensagemEnviada?.key?.id || !mensagemEnviada?.message) return;
-    persistMensagensEnviadas.mapa.set(
-      `${mensagemEnviada.key.remoteJid}:${mensagemEnviada.key.id}`,
-      mensagemEnviada.message
-    );
+    // Guardado só pelo id da mensagem, NUNCA por `remoteJid:id`.
+    //
+    // O id do WhatsApp já é único. Compor com o remoteJid quebrava tudo, porque no envio ele vem
+    // como número (5511986694787@s.whatsapp.net) e no pedido de reenvio o aparelho se identifica
+    // pelo @lid (157728429347047@lid). Chaves diferentes, busca sempre vazia — provado no log:
+    // "[ENVIO] id=3EB0281C..." seguido de "[REENVIO] 3EB0281C... NÃO estava no cache".
+    persistMensagensEnviadas.mapa.set(mensagemEnviada.key.id, mensagemEnviada.message);
     // Teto pra não crescer sem fim: pedido de reenvio chega em minutos, não em dias.
     while (persistMensagensEnviadas.mapa.size > 300) {
       persistMensagensEnviadas.mapa.delete(persistMensagensEnviadas.mapa.keys().next().value);
