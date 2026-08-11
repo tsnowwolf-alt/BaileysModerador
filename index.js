@@ -3209,8 +3209,11 @@ app.get('/painel', (req, res) => {
             <form method="POST" action="/painel/adiar-mencao">
               <button class="botao-secundario" type="submit">🔕 Contar o intervalo a partir de hoje</button>
             </form>
-            <form method="POST" action="/painel/resetar" onsubmit="return confirm('Resetar? Libera o grupo se estiver preso em enquete/debate, devolve o tópico em andamento pra fila (se houver) e zera a marca de última menção geral, pra poder testar de novo mesmo depois de um ciclo já ter terminado.')">
-              <button class="botao-secundario" type="submit">↺ Resetar ciclo (uso em teste)</button>
+            <form method="POST" action="/painel/resetar" onsubmit="return confirm('Cancelar o ciclo de hoje? Libera o grupo se estiver preso em enquete/debate, devolve o tópico pra fila e marca o dia de hoje como já usado — nenhuma enquete nova sai hoje.')">
+              <button class="botao-secundario" type="submit">⏹ Cancelar o ciclo de hoje</button>
+            </form>
+            <form method="POST" action="/painel/rodar-agora" onsubmit="return confirm('Disparar a enquete agora? Use só pra testar.')">
+              <button class="botao-secundario" type="submit">▶ Rodar enquete agora (teste)</button>
             </form>
           </div>
 
@@ -4157,6 +4160,22 @@ app.post('/painel/topicos/apagar', (req, res) => {
 // começar a contar de hoje. Faz falta porque `ultimaMencaoEm` nasce nulo, e nulo é tratado como
 // "infinitos dias sem mencionar" — então o primeiro ciclo depois de configurar SEMPRE menciona
 // todo mundo, por mais alto que esteja o intervalo. Era o que não dava pra evitar antes.
+// Dispara o ciclo na hora, sem depender do relógio.
+//
+// Existe pra tirar o teste do caminho do agendamento. Antes, testar significava mexer no horário
+// configurado e esperar — e era isso que produzia enquete repetida, porque salvar a configuração
+// com horário à frente reagenda pro mesmo dia. Com um botão explícito, testar não interfere no
+// agendamento de ninguém.
+app.post('/painel/rodar-agora', async (req, res) => {
+  if (estadoDebate.get().fase !== 'normal') {
+    console.log('[CICLO MANUAL] Já existe enquete ou debate em andamento — nada foi feito.');
+    return res.redirect('/painel?rodar=ocupado');
+  }
+  console.log('[CICLO MANUAL] Enquete disparada pelo painel.');
+  iniciarCicloDebate().catch((err) => console.error('[CICLO MANUAL] Falhou:', err.message));
+  res.redirect('/painel?rodar=1');
+});
+
 app.post('/painel/adiar-mencao', (req, res) => {
   estadoDebate.set({ ultimaMencaoEm: new Date().toISOString() });
   const cfg = configDebate.get();
@@ -4337,8 +4356,13 @@ app.post('/painel/resetar', async (req, res) => {
     pollCreatorCandidatos: [],
     topicoId: null,
     ultimaMencaoEm: null,
-    // Limpa a marca de "já rodou hoje" — é justamente o que o reset serve pra permitir.
-    ultimoCicloIniciadoEm: null
+    // NÃO limpa `ultimoCicloIniciadoEm` — pelo contrário, marca hoje como já usado.
+    //
+    // Antes o reset apagava essa marca, e o efeito era o oposto do esperado: cancelar o ciclo
+    // rearmava a enquete pro mesmo dia, bastando o horário configurado ainda estar à frente.
+    // Aconteceu de verdade — três enquetes num dia. Cancelar tem que CANCELAR.
+    // Pra rodar de novo hoje existe o botão "Rodar enquete agora", que é explícito.
+    ultimoCicloIniciadoEm: new Date().toISOString()
   });
   atualizarProximoDisparo();
 
