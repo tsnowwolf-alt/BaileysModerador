@@ -1695,7 +1695,28 @@ async function resolverEnquete() {
         }
 
         if (contagem.size > 0) {
-          const [opcaoVencedora] = [...contagem.entries()].reduce((a, b) => (b[1] > a[1] ? b : a));
+          // DESEMPATE PELA ORDEM DA ENQUETE.
+          //
+          // `contagem` é um Map, e a ordem dele é a ordem em que os VOTOS foram processados, não
+          // a ordem das opções na enquete. O reduce antigo (`b[1] > a[1] ? b : a`) mantinha o
+          // primeiro do Map em caso de empate — ou seja, ganhava a opção que recebeu voto mais
+          // cedo, o que da tela do WhatsApp parece aleatório.
+          //
+          // Empate agora vai pra opção listada primeiro na enquete, que é o critério visível pra
+          // quem votou: 4 x 4 entre a 1ª e a 3ª opção dá a 1ª.
+          const ordemNaEnquete = (estado.pollOpcoesEnviadas?.length ? estado.pollOpcoesEnviadas : estado.opcoes) || [];
+          const posicao = (opcao) => {
+            const i = ordemNaEnquete.indexOf(opcao);
+            return i === -1 ? Number.MAX_SAFE_INTEGER : i;
+          };
+          const [opcaoVencedora, votosVencedor] = [...contagem.entries()].reduce((a, b) => {
+            if (b[1] !== a[1]) return b[1] > a[1] ? b : a;
+            return posicao(b[0]) < posicao(a[0]) ? b : a;
+          });
+          const empatadas = [...contagem.entries()].filter(([, n]) => n === votosVencedor);
+          if (empatadas.length > 1) {
+            console.log(`DIAGNÓSTICO ENQUETE: empate em ${votosVencedor} voto(s) entre [${empatadas.map(([o]) => o).join(' | ')}] — venceu "${opcaoVencedora}" por vir primeiro na enquete.`);
+          }
           temaVencedor = opcaoVencedora;
           sabemosVencedor = true;
         }
