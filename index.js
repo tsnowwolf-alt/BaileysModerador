@@ -871,6 +871,7 @@ const estadoDebate = criarValorPersistente('estado-debate.json', {
   pollCreatorCandidatos: [],    // formas possíveis do JID do bot NAQUELE grupo, em ordem de aposta
   pollCreatorConfirmado: null,  // preenchido no 1º voto que decriptar; usado primeiro nos demais
   ultimoCicloIniciadoEm: null,
+  mencionouNesteCiclo: false,
   ultimaMencaoEm: null,
   topicoId: null,
   proximoDisparoEm: null
@@ -1469,6 +1470,10 @@ async function iniciarCicloDebate() {
       pollCreatorCandidatos,
       ultimoCicloIniciadoEm: new Date().toISOString(),
       ultimaMencaoEm: deveMencionar ? new Date().toISOString() : estadoAtual.ultimaMencaoEm,
+      // Guarda a DECISÃO, não recalcula depois. O anúncio de início do debate acontece 1h
+      // adiante, quando `ultimaMencaoEm` já é hoje — recalcular ali daria sempre 0 dias e ele
+      // nunca mencionaria, nem no dia certo. A decisão é uma por ciclo, tomada aqui.
+      mencionouNesteCiclo: deveMencionar,
       proximoDisparoEm: null
     });
 
@@ -1710,13 +1715,25 @@ async function resolverEnquete() {
     if (debateComeca) {
       let mensagemAnuncio = null;
       try {
+        // Menção geral aqui segue a MESMA decisão da enquete deste ciclo.
+        //
+        // Antes este trecho marcava o grupo inteiro sempre, sem consultar nada e sem gravar
+        // `ultimaMencaoEm`. Ou seja: o intervalo configurado no painel valia só pra metade dos
+        // anúncios, e o outro anúncio marcava todo mundo TODO DIA. Num grupo de 40 pessoas isso
+        // é uma parede de menções diária — e é exatamente o padrão que queima número.
+        //
+        // Dia de menção: marca todo mundo aqui também, como o dono pediu.
+        // Dia comum: não marca ninguém. Quem está no grupo vê o anúncio do mesmo jeito.
         let jidsParaMencionar = [];
-        try {
-          const metadata = await sock.groupMetadata(estado.grupoId);
-          jidsParaMencionar = metadata.participants.map((p) => p.id);
-        } catch (err) {
-          console.error('Erro ao buscar participantes pra mencionar no início do debate:', err.message);
+        if (estado.mencionouNesteCiclo) {
+          try {
+            const metadata = await sock.groupMetadata(estado.grupoId);
+            jidsParaMencionar = metadata.participants.map((p) => p.id);
+          } catch (err) {
+            console.error('Erro ao buscar participantes pra mencionar no início do debate:', err.message);
+          }
         }
+        console.log(`Início do debate anunciado ${jidsParaMencionar.length > 0 ? `com menção geral (${jidsParaMencionar.length} pessoas)` : 'sem menção geral'}.`);
         const blocoMencoes = jidsParaMencionar.length > 0
           ? `\n\n${jidsParaMencionar.map((jid) => `@${jid.split('@')[0]}`).join(' ')}`
           : '';
@@ -4356,6 +4373,7 @@ app.post('/painel/resetar', async (req, res) => {
     pollCreatorCandidatos: [],
     topicoId: null,
     ultimaMencaoEm: null,
+    mencionouNesteCiclo: false,
     // NÃO limpa `ultimoCicloIniciadoEm` — pelo contrário, marca hoje como já usado.
     //
     // Antes o reset apagava essa marca, e o efeito era o oposto do esperado: cancelar o ciclo
