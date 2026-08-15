@@ -2212,12 +2212,22 @@ async function connectToWhatsApp() {
 
     if (qr) {
       currentQR = qr;
+      // Chegou QR = o handshake com o servidor do WhatsApp funcionou; o que falta é só alguém
+      // escanear. Isso NÃO é falha de rede, então a espera não pode crescer por causa dele.
+      // Antes, cada código expirado sem scan contava como queda e a escala subia até 120s —
+      // o /qr recarregava a cada 15s e passava minutos em "Preparando o código…".
+      tentativasReconexao = 0;
       console.log('\n=== Escaneie este QR code no WhatsApp: Aparelhos conectados > Conectar aparelho ===\n');
       qrcode.generate(qr, { small: true });
     }
 
     if (connection === 'close') {
       isConnected = false;
+      // O QR morre junto com o socket: cada código só vale enquanto ESTE socket estiver de pé
+      // esperando por ele. Sem zerar aqui, a variável guardava o último código e a página /qr
+      // continuava desenhando um cadáver a cada recarga — o celular lia, não achava ninguém do
+      // outro lado e respondia "Não foi possível conectar". Rescanear dava sempre o mesmo erro.
+      currentQR = null;
       // Fechamento provocado por troca de conta ou desligamento: não reconectar, senão o socket
       // velho ressuscita e briga com o novo.
       if (trocaEmAndamento) {
@@ -2227,7 +2237,19 @@ async function connectToWhatsApp() {
       const statusCode = lastDisconnect?.error instanceof Boom
         ? lastDisconnect.error.output?.statusCode
         : undefined;
-      const shouldReconnect = statusCode !== DisconnectReason.loggedOut;
+
+      // Motivos em que a credencial gravada não serve mais para nada. Reconectar com ela é
+      // looping infinito e — pior — SILENCIOSO: com creds.json na pasta o Baileys tenta RETOMAR
+      // a sessão em vez de parear, então nenhum QR é emitido e o painel fica eternamente em
+      // "Ativa, conectando…". Só o 401 estava tratado aqui; 403, 411 e 500 caíam no ramo de
+      // reconectar. Números escritos na mão de propósito: DisconnectReason.forbidden não existe
+      // em todas as versões do Baileys e um `undefined` no Set faria o 403 escapar de novo.
+      //   401 loggedOut          — desvinculado no celular
+      //   403 forbidden          — número bloqueado/restrito pelo WhatsApp
+      //   411 multideviceMismatch— incompatibilidade de multi-aparelho
+      //   500 badSession         — credencial corrompida
+      const MOTIVOS_SEM_VOLTA = new Set([401, 403, 411, 500]);
+      const shouldReconnect = !MOTIVOS_SEM_VOLTA.has(statusCode);
 
       // Outra sessão assumiu a conta (abriram o WhatsApp Web com o mesmo número). Reconectar
       // rápido aqui vira cabo de guerra: as duas sessões derrubam uma à outra em looping. Espera
@@ -2245,7 +2267,13 @@ async function connectToWhatsApp() {
       if (shouldReconnect) {
         reconectarSeAindaForAVez(minhaGeracao, atraso);
       } else {
-        console.log(`Sessão desconectada (logout) — limpando credenciais antigas e reiniciando pra gerar um QR novo.`);
+        // 403 não se resolve com QR novo: o problema é a conta, não a credencial. Mas limpar e
+        // gerar o código mesmo assim é o certo — é o que permite parear OUTRO número por ali.
+        if (statusCode === 403) {
+          console.error('🔴 [CONTAS] Motivo 403 (forbidden): o WhatsApp recusou esta conta. O número está bloqueado ou restrito.');
+          console.error('🔴 Escanear de novo com o MESMO número não vai funcionar. Pareie outro número em /qr.');
+        }
+        console.log(`Sessão inutilizável (motivo ${statusCode ?? 'n/d'} — ${nomeDoMotivo(statusCode)}). Limpando credenciais e reiniciando pra gerar um QR novo.`);
         await limparCredenciaisAntigasDoBaileys();
         reconectarSeAindaForAVez(minhaGeracao, 3000);
       }
