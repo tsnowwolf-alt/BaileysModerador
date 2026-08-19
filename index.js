@@ -203,6 +203,22 @@ function registrarErroLogin(ip) {
 const AUTH_FOLDER = process.env.AUTH_FOLDER || 'auth_info_baileys';
 const PORT = process.env.PORT || 3000;
 
+// Identidade que o bot apresenta ao WhatsApp, no formato "SO,Navegador,Versão"
+// (ex.: "Ubuntu,Chrome,22.04.4"). É o nome que aparece em "Aparelhos conectados" no celular.
+//
+// VAZIO é o padrão e é o que está no ar hoje: nada é passado e o Baileys usa a identidade dele.
+// Esta variável existe por um motivo só — o pareamento por CÓDIGO é sensível a esse campo em
+// alguns ambientes, e sem ela um eventual ajuste exigiria novo deploy. Mexer nisso muda o
+// handshake com o WhatsApp: use enquanto estiver PAREANDO um número, nunca numa sessão que já
+// está funcionando.
+const BAILEYS_BROWSER = (process.env.BAILEYS_BROWSER || '')
+  .split(',')
+  .map((parte) => parte.trim())
+  .filter(Boolean);
+if (BAILEYS_BROWSER.length > 0 && BAILEYS_BROWSER.length !== 3) {
+  console.error(`[BOOT] BAILEYS_BROWSER precisa de 3 partes separadas por vírgula; recebi ${BAILEYS_BROWSER.length}. Ignorando e usando o padrão do Baileys.`);
+}
+
 // Primeira coisa que sai no log. Se essa linha aparecer várias vezes em poucos minutos, o processo
 // está morrendo e sendo ressuscitado — isso NÃO é boot normal, por mais que no fim funcione.
 const INICIADO_EM = Date.now();
@@ -1294,6 +1310,20 @@ let currentQR = null;
 let isConnected = false;
 let tickerDebateIniciado = false;
 
+// --- Pareamento por código de 8 dígitos ---
+//
+// Alternativa ao QR: em vez de apontar a câmera pra uma tela, você digita o número no painel,
+// o WhatsApp devolve um código, e você digita esse código no celular em "Conectar com número
+// de telefone". Some o problema todo de código expirado, foto de tela e câmera.
+//
+// 'numero' é o pedido em aberto (só dígitos, com DDI). 'codigo' é o que o WhatsApp devolveu —
+// ele morre junto com o socket, exatamente como o QR, e por isso é zerado no 'close'.
+let pareamento = { numero: null, codigo: null, pedidoEm: null, erro: null };
+
+function limparPareamento() {
+  pareamento = { numero: null, codigo: null, pedidoEm: null, erro: null };
+}
+
 // Guarda o que o bot mandou, pra poder REENVIAR quando o aparelho de alguém não conseguir
 // decriptar. Quando isso acontece, o celular do destinatário pede a mensagem de volta e o Baileys
 // chama getMessage() pra reencriptar e mandar de novo. Se getMessage devolver undefined, não há
@@ -2069,6 +2099,31 @@ function reconectarSeAindaForAVez(geracao, atraso) {
   }, atraso);
 }
 
+// Pede o código de 8 dígitos ao WhatsApp.
+//
+// O momento de chamar isso é delicado: requestPairingCode manda um nó pela conexão, então exige
+// o socket JÁ de pé, e exige a sessão ainda NÃO registrada. Chamar logo depois do makeWASocket
+// costuma estourar "Connection Closed" porque o handshake não terminou. O gatilho usado é a
+// chegada de um QR: quando o WhatsApp manda um QR, as duas condições estão provadas de uma vez.
+async function pedirCodigoDePareamento(geracao) {
+  const numero = pareamento.numero;
+  if (!numero || !sock) return;
+  try {
+    const bruto = await sock.requestPairingCode(numero);
+    // Socket trocou no meio do pedido: o código pertence a uma conexão que já morreu.
+    if (geracao !== geracaoConexao) return;
+
+    const limpo = String(bruto).replace(/[^A-Z0-9]/gi, '').toUpperCase();
+    const formatado = limpo.length === 8 ? `${limpo.slice(0, 4)}-${limpo.slice(4)}` : limpo;
+    pareamento = { ...pareamento, codigo: formatado, pedidoEm: Date.now(), erro: null };
+    console.log(`[PAREAMENTO] Código para +${numero}: ${formatado} — digite no celular em "Conectar com número de telefone".`);
+  } catch (err) {
+    if (geracao !== geracaoConexao) return;
+    pareamento = { ...pareamento, codigo: null, pedidoEm: null, erro: err.message };
+    console.error('[PAREAMENTO] Falha ao pedir o código:', err.message);
+  }
+}
+
 // Roda uma vez só, independente de quantas reconexões aconteçam.
 function iniciarVigiaDeConexao() {
   if (vigiaConexaoIniciado) return;
@@ -2099,6 +2154,31 @@ function iniciarVigiaDeConexao() {
   }, 60_000);
 }
 
+// Reinicia o socket SEM trocar de conta. Existe por causa do pareamento: com creds.json na pasta
+// o Baileys tenta retomar a sessão gravada e nunca aceita um pareamento novo — nem QR, nem código.
+// Era o buraco do painel: só dava pra apagar a sessão de uma conta que NÃO estivesse ativa.
+async function reiniciarSocket({ limparSessao = false } = {}) {
+  geracaoConexao++;   // invalida timers e handlers da conexão anterior
+  trocaEmAndamento = true;
+  try {
+    if (sock) {
+      try { sock.end(undefined); } catch { /* socket já morto */ }
+    }
+    sock = null;
+    isConnected = false;
+    currentQR = null;
+    // A ordem aqui não é cosmética. O socket que está morrendo ainda tem o handler de
+    // 'creds.update' ligado no saveCreds da sessão ANTIGA — se a limpeza rodar antes de ele
+    // terminar de fechar, um creds.json ressuscita depois do apagamento e o socket novo tenta
+    // retomar a sessão morta em vez de parear. Espera fechar, DEPOIS apaga.
+    await new Promise((r) => setTimeout(r, 1200));
+    if (limparSessao) await limparCredenciaisAntigasDoBaileys();
+  } finally {
+    trocaEmAndamento = false;
+  }
+  connectToWhatsApp().catch((err) => console.error('[PAREAMENTO] Erro ao reconectar:', err.message));
+}
+
 async function trocarConta(nome) {
   geracaoConexao++;   // invalida timers e handlers da conexão anterior
   trocaEmAndamento = true;
@@ -2109,6 +2189,7 @@ async function trocarConta(nome) {
     sock = null;
     isConnected = false;
     currentQR = null;
+    limparPareamento();   // pedido de código de outra conta não sobrevive à troca
     contaConectada = null;
 
     configContas.set({ ativa: nome });
@@ -2174,6 +2255,7 @@ async function connectToWhatsApp() {
     sock = null;
     isConnected = false;
     currentQR = null;
+    limparPareamento();   // pedido de código de outra conta não sobrevive à troca
     contaConectada = null;
     console.log('[CONTAS] Nenhuma conta ativa — o bot está desligado. Ligue em /contas.');
     return;
@@ -2194,9 +2276,15 @@ async function connectToWhatsApp() {
   const { version, isLatest } = await fetchLatestBaileysVersion();
   console.log(`Usando WhatsApp Web v${version.join('.')} (mais recente conhecida: ${isLatest})`);
 
+  const identidade = BAILEYS_BROWSER.length === 3 ? BAILEYS_BROWSER : null;
+  if (identidade) console.log(`[CONTAS] Identidade do cliente vinda de BAILEYS_BROWSER: ${identidade.join(' / ')}`);
+
   sock = makeWASocket({
     auth: state,
     version,
+    // Espalhado condicionalmente: sem a variável, a chave 'browser' nem existe no objeto e o
+    // Baileys segue com o padrão dele — exatamente o comportamento de antes desta mudança.
+    ...(identidade ? { browser: identidade } : {}),
     logger: pino({ level: 'silent' }),
     getMessage
   });
@@ -2211,14 +2299,25 @@ async function connectToWhatsApp() {
     const { connection, lastDisconnect, qr } = update;
 
     if (qr) {
-      currentQR = qr;
       // Chegou QR = o handshake com o servidor do WhatsApp funcionou; o que falta é só alguém
       // escanear. Isso NÃO é falha de rede, então a espera não pode crescer por causa dele.
       // Antes, cada código expirado sem scan contava como queda e a escala subia até 120s —
       // o /qr recarregava a cada 15s e passava minutos em "Preparando o código…".
       tentativasReconexao = 0;
-      console.log('\n=== Escaneie este QR code no WhatsApp: Aparelhos conectados > Conectar aparelho ===\n');
-      qrcode.generate(qr, { small: true });
+
+      // Pedido de pareamento por código em aberto: o QR é o gatilho (ver pedirCodigoDePareamento).
+      // Nesse modo o QR não é publicado nem no painel nem no terminal: duas formas de parear na
+      // mesma tela só criam chance de você escanear um e digitar o outro.
+      if (pareamento.numero && !pareamento.codigo && !pareamento.erro) {
+        currentQR = null;
+        pedirCodigoDePareamento(minhaGeracao).catch((err) => console.error('[PAREAMENTO] Erro inesperado:', err.message));
+      } else if (pareamento.numero) {
+        currentQR = null;   // já tem código (ou erro) na tela: o QR não entra no meio
+      } else {
+        currentQR = qr;
+        console.log('\n=== Escaneie este QR code no WhatsApp: Aparelhos conectados > Conectar aparelho ===\n');
+        qrcode.generate(qr, { small: true });
+      }
     }
 
     if (connection === 'close') {
@@ -2228,6 +2327,9 @@ async function connectToWhatsApp() {
       // continuava desenhando um cadáver a cada recarga — o celular lia, não achava ninguém do
       // outro lado e respondia "Não foi possível conectar". Rescanear dava sempre o mesmo erro.
       currentQR = null;
+      // Mesma coisa vale pro código de 8 dígitos: ele só é válido no socket que o pediu. O número
+      // continua guardado, então o próximo socket pede um código novo sozinho.
+      pareamento = { ...pareamento, codigo: null, pedidoEm: null };
       // Fechamento provocado por troca de conta ou desligamento: não reconectar, senão o socket
       // velho ressuscita e briga com o novo.
       if (trocaEmAndamento) {
@@ -2241,14 +2343,17 @@ async function connectToWhatsApp() {
       // Motivos em que a credencial gravada não serve mais para nada. Reconectar com ela é
       // looping infinito e — pior — SILENCIOSO: com creds.json na pasta o Baileys tenta RETOMAR
       // a sessão em vez de parear, então nenhum QR é emitido e o painel fica eternamente em
-      // "Ativa, conectando…". Só o 401 estava tratado aqui; 403, 411 e 500 caíam no ramo de
-      // reconectar. Números escritos na mão de propósito: DisconnectReason.forbidden não existe
-      // em todas as versões do Baileys e um `undefined` no Set faria o 403 escapar de novo.
-      //   401 loggedOut          — desvinculado no celular
-      //   403 forbidden          — número bloqueado/restrito pelo WhatsApp
-      //   411 multideviceMismatch— incompatibilidade de multi-aparelho
-      //   500 badSession         — credencial corrompida
-      const MOTIVOS_SEM_VOLTA = new Set([401, 403, 411, 500]);
+      // "Ativa, conectando…". Números escritos na mão de propósito: DisconnectReason.forbidden
+      // não existe em todas as versões do Baileys e um `undefined` no Set faria o 403 escapar.
+      //   401 loggedOut — desvinculado no celular
+      //   403 forbidden — número bloqueado/restrito pelo WhatsApp
+      //
+      // 411 e 500 chegaram a entrar aqui e FORAM RETIRADOS. Eles não tinham evidência no log,
+      // vieram de precaução minha, e o custo de errar neles é o pior possível: apagar uma sessão
+      // boa por causa de uma falha passageira, derrubar o bot e exigir pareamento na mão — que é
+      // justamente o que faz a enquete do dia não sair. Na dúvida, reconectar é sempre mais
+      // barato que apagar.
+      const MOTIVOS_SEM_VOLTA = new Set([401, 403]);
       const shouldReconnect = !MOTIVOS_SEM_VOLTA.has(statusCode);
 
       // Outra sessão assumiu a conta (abriram o WhatsApp Web com o mesmo número). Reconectar
@@ -2279,6 +2384,12 @@ async function connectToWhatsApp() {
       }
     } else if (connection === 'open') {
       currentQR = null;
+      // Pareou: o pedido cumpriu a função. Deixar o número guardado faria a próxima queda de rede
+      // disparar um pedido de código novo numa sessão que já está registrada.
+      if (pareamento.numero) {
+        console.log(`[PAREAMENTO] Concluído com sucesso para +${pareamento.numero}.`);
+        limparPareamento();
+      }
       isConnected = true;
       // Só zera depois de conectar de verdade. Zerar em 'connecting' faria a espera reiniciar do
       // começo a cada tentativa e o crescimento nunca aconteceria.
@@ -2703,13 +2814,31 @@ app.get('/health', (req, res) => {
   res.json({ ok: true, conectado: !!sock?.user });
 });
 
+// Segunda via de pareamento, oferecida embaixo do QR. Some quando um pedido está em andamento,
+// porque aí a tela inteira já é sobre o código.
+const FORMULARIO_CODIGO = `
+  <details class="editor" style="margin-top:16px">
+    <summary>Não consegue escanear? Parear digitando um código</summary>
+    <div class="editor__corpo">
+      <p class="editor__dica">O WhatsApp gera um código de 8 dígitos e você digita ele no celular, sem câmera. <strong>Isto apaga a sessão gravada desta conta</strong> e começa um pareamento do zero — use quando for conectar um número novo.</p>
+      <form method="POST" action="/qr/codigo" onsubmit="return confirm('Apagar a sessão gravada desta conta e parear por código? Os dados do grupo não são afetados.')">
+        <label class="campo">Número com DDI e DDD, só dígitos<input type="tel" name="numero" placeholder="5511986694787" inputmode="numeric" required></label>
+        <button class="botao" type="submit">Gerar código</button>
+      </form>
+    </div>
+  </details>`;
+
 app.get('/qr', async (req, res) => {
   const cfg = configContas.get();
   const rotuloConta = cfg.ativa ? (cfg.contas?.[cfg.ativa]?.rotulo || cfg.ativa) : null;
 
   // Página separada de propósito: ela se recarrega sozinha a cada 15s porque o QR expira rápido,
   // e não faz sentido ficar recarregando a tela de contas por causa disso.
-  const autoRefresh = !isConnected ? '<script>setTimeout(() => location.reload(), 15000);</script>' : '';
+  // O QR roda mais rápido do que parece: o PRIMEIRO de cada ciclo vive 60s, os cinco seguintes
+  // vivem 20s cada (medido no log: 19 trocas de 20s contra 4 de 60s). Com recarga de 15s, o
+  // código na tela podia estar a 15s de vida de um total de 20 — você escaneava um cadáver e o
+  // celular respondia "Não foi possível conectar". 5s limita o atraso a 1/4 da vida do código.
+  const autoRefresh = !isConnected ? '<script>setTimeout(() => location.reload(), 5000);</script>' : '';
 
   let miolo;
   if (!cfg.ativa) {
@@ -2726,12 +2855,44 @@ app.get('/qr', async (req, res) => {
         <p>A conta <strong>${escapeHtml(rotuloConta)}</strong> está pareada e no ar. Não precisa escanear nada.</p>
         <a class="botao-link" href="/contas">Voltar para Contas</a>
       </div>`;
+  } else if (pareamento.erro) {
+    miolo = `
+      <div class="painel-qr painel-qr--neutro">
+        <h2>O WhatsApp recusou o pedido</h2>
+        <p>Não foi possível gerar o código para <strong>+${escapeHtml(pareamento.numero || '')}</strong>:</p>
+        <p class="pareamento__erro">${escapeHtml(pareamento.erro)}</p>
+        <p class="nota">Causas comuns: número digitado errado (precisa do DDI 55 e do DDD), número sem WhatsApp ativo, ou conta restrita.</p>
+        <form method="POST" action="/qr/cancelar-codigo">
+          <button class="botao" type="submit">Voltar para o QR code</button>
+        </form>
+      </div>`;
+  } else if (pareamento.numero && pareamento.codigo) {
+    miolo = `
+      <div class="painel-qr">
+        <h2>Digite este código no celular<br><em>+${escapeHtml(pareamento.numero)}</em></h2>
+        <p class="pareamento__codigo">${escapeHtml(pareamento.codigo)}</p>
+        <p>No aparelho: <strong>Aparelhos conectados → Conectar aparelho → Conectar com número de telefone</strong></p>
+        <p class="nota">O código vale poucos minutos. Se expirar, esta página gera outro sozinha — sempre use o que estiver na tela agora, nunca um anotado antes.</p>
+        <form method="POST" action="/qr/cancelar-codigo">
+          <button class="botao-secundario" type="submit">Cancelar e usar QR code</button>
+        </form>
+      </div>`;
+  } else if (pareamento.numero) {
+    miolo = `
+      <div class="painel-qr painel-qr--esperando">
+        <h2>Pedindo o código…</h2>
+        <p>Gerando o código de 8 dígitos para <strong>+${escapeHtml(pareamento.numero)}</strong>. Esta página se atualiza sozinha.</p>
+        <form method="POST" action="/qr/cancelar-codigo">
+          <button class="botao-secundario" type="submit">Cancelar</button>
+        </form>
+      </div>`;
   } else if (!currentQR) {
     miolo = `
       <div class="painel-qr painel-qr--esperando">
         <h2>Preparando o código…</h2>
         <p>O QR da conta <strong>${escapeHtml(rotuloConta)}</strong> aparece aqui em alguns segundos. Esta página se atualiza sozinha.</p>
-      </div>`;
+      </div>
+      ${FORMULARIO_CODIGO}`;
   } else {
     try {
       const imagem = await QRCode.toDataURL(currentQR, { width: 300 });
@@ -2740,9 +2901,10 @@ app.get('/qr', async (req, res) => {
         <h2>Escaneie com o número da conta<br><em>${escapeHtml(rotuloConta)}</em></h2>
         <p>No celular: <strong>Aparelhos conectados → Conectar aparelho</strong></p>
         <img src="${imagem}" width="300" height="300" alt="QR code para parear">
-        <p class="nota">O código expira em segundos. Esta página se atualiza sozinha a cada 15s com um novo — não precisa fazer nada.</p>
+        <p class="nota">O código expira em segundos. Esta página se atualiza sozinha a cada 5s. Escaneie o código que estiver na tela AGORA — cada um vive 20 segundos.</p>
         <a class="botao-link" href="/contas">Voltar para Contas</a>
-      </div>`;
+      </div>
+      ${FORMULARIO_CODIGO}`;
     } catch (err) {
       miolo = `<div class="painel-qr painel-qr--neutro"><h2>Erro ao gerar o QR</h2><p>${escapeHtml(err.message)}</p></div>`;
     }
@@ -2763,6 +2925,10 @@ app.get('/qr', async (req, res) => {
     .painel-qr p { margin: 0 0 16px; font-size: 13.5px; color: var(--apagado); }
     .painel-qr img { display: block; margin: 0 auto 16px; border-radius: 10px; max-width: 100%; height: auto; }
     .painel-qr .nota { font-size: 12.5px; }
+    .pareamento__codigo { font-family: 'IBM Plex Mono', ui-monospace, monospace; font-size: 40px; font-weight: 600; letter-spacing: 0.08em;
+                          color: var(--tinta) !important; background: var(--papel); border: 1px dashed var(--dourado); border-radius: 12px;
+                          padding: 18px 10px; margin: 4px 0 16px !important; user-select: all; word-break: break-all; }
+    .pareamento__erro { background: var(--vermelho-suave); color: #7A2A20 !important; border-radius: 8px; padding: 10px 13px; font-size: 13.5px; }
     .botao-link { display: inline-block; font-weight: 600; font-size: 13.5px; text-decoration: none; color: var(--tinta); background: var(--papel); border: 1px solid var(--linha); padding: 9px 16px; border-radius: 8px; }
     .botao-link:hover { border-color: var(--tinta); }`,
     corpo: `
@@ -2772,6 +2938,42 @@ app.get('/qr', async (req, res) => {
     </header>
     ${miolo}`
   }));
+});
+
+app.post('/qr/codigo', (req, res) => {
+  if (!configContas.get().ativa) return res.redirect('/qr');
+
+  const numero = String(req.body.numero || '').replace(/\D/g, '');
+  // 10 = menor número plausível com DDI. 15 = teto do padrão E.164.
+  if (numero.length < 10 || numero.length > 15) {
+    pareamento = {
+      numero: numero || null,
+      codigo: null,
+      pedidoEm: null,
+      erro: 'Número fora do formato esperado. Use DDI + DDD + número, só dígitos — ex.: 5511986694787.'
+    };
+    return res.redirect('/qr');
+  }
+
+  pareamento = { numero, codigo: null, pedidoEm: null, erro: null };
+  console.log(`[PAREAMENTO] Pedido aberto para +${numero} na conta "${configContas.get().ativa}". Apagando a sessão gravada e subindo um socket limpo.`);
+
+  // Responde primeiro: a reinicialização leva alguns segundos e não há motivo pra segurar o
+  // navegador esperando. A página se atualiza sozinha e mostra o código quando ele chegar.
+  res.redirect('/qr');
+  reiniciarSocket({ limparSessao: true }).catch((err) => console.error('[PAREAMENTO] Falha ao reiniciar:', err.message));
+});
+
+app.post('/qr/cancelar-codigo', (req, res) => {
+  const tinhaPedido = !!pareamento.numero;
+  limparPareamento();
+  res.redirect('/qr');
+  // Sem sessão gravada (ela foi apagada ao abrir o pedido), o socket novo cai direto no QR.
+  // Sem reiniciar, o painel esperaria o rodízio de códigos do socket atual — até um minuto.
+  if (tinhaPedido) {
+    console.log('[PAREAMENTO] Pedido cancelado. Voltando pro QR code.');
+    reiniciarSocket().catch((err) => console.error('[PAREAMENTO] Falha ao reiniciar:', err.message));
+  }
 });
 
 // --- Casca compartilhada das páginas do painel ---
