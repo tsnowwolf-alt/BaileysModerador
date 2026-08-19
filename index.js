@@ -1214,6 +1214,12 @@ function acumularVotoSeguro(votoEntry, votanteJid) {
     ? votoEntry.vote.selectedOptions.map((b) => garantirBuffer(b)?.toString('hex')).filter(Boolean)
     : null;
 
+  // Seleção PRESENTE e vazia = a pessoa desmarcou o voto na enquete.
+  // Isso é diferente de seleção AUSENTE, que é o que chega pelo caminho cifrado
+  // (messages.upsert, onde só vêm encPayload/encIv) e significa apenas "ainda não sei em quê".
+  // Colapsar os dois casos em `null` era o que fazia uma retirada continuar contando como voto.
+  const selecaoVazia = Array.isArray(votoEntry.vote?.selectedOptions) && votoEntry.vote.selectedOptions.length === 0;
+
   const registro = {
     id: idVoto,
     votante: votanteJid,
@@ -1223,6 +1229,10 @@ function acumularVotoSeguro(votoEntry, votanteJid) {
     encPayloadB64: bytesParaBase64(votoEntry.vote?.encPayload) || anterior?.encPayloadB64 || null,
     encIvB64: bytesParaBase64(votoEntry.vote?.encIv) || anterior?.encIvB64 || null,
     hashesSelecionados: hashesNovos || anterior?.hashesSelecionados || null,
+    // true = desmarcou (sabemos). false = selecionou algo (sabemos). null = ainda não sabemos.
+    // A mesma mensagem chega pelos dois caminhos, então um "não sei" que chegue depois nunca
+    // pode apagar um "sei" que já chegou — mesma regra dos outros campos deste registro.
+    retirado: selecaoVazia ? true : (hashesNovos?.length ? false : (anterior?.retirado ?? null)),
     opcaoResolvida: anterior?.opcaoResolvida || null
   };
 
@@ -1593,6 +1603,11 @@ function montarContextoEnquete(estado, pollEncKeyExterna = null) {
 // da tag, não devolve texto plausível errado. Ou seja, não existe falso positivo aqui — só acerto
 // verificado ou falha explícita.
 function descobrirOpcaoDoVoto(registro, ctx) {
+  // Retirada já conhecida: não há opção pra procurar, e quem desmarcou não é votante.
+  if (registro.retirado === true) {
+    return { opcao: null, decriptou: true, via: 'retirada', criador: null, retirado: true };
+  }
+
   if (registro.opcaoResolvida) {
     return { opcao: registro.opcaoResolvida, decriptou: true, via: 'cache', criador: null };
   }
@@ -1620,6 +1635,11 @@ function descobrirOpcaoDoVoto(registro, ctx) {
           voterJid
         });
         const hashes = (voteMsg.selectedOptions || []).map((b) => garantirBuffer(b).toString('hex'));
+        // Decriptou e veio vazio: isso é retirada de voto, não falha de decriptação. Sem esta
+        // distinção o registro caía em "voto sem opção resolvida" e virava alarme falso no log.
+        if (hashes.length === 0) {
+          return { opcao: null, decriptou: true, via: 'retirada-decriptada', criador: pollCreatorJid, retirado: true };
+        }
         const opcao = opcaoPorHash(hashes, ctx.opcoesHash);
         return { opcao, decriptou: true, via: 'manual', criador: pollCreatorJid };
       } catch {
@@ -1644,6 +1664,15 @@ function resolverVotoAgora(idVoto) {
 
     const ctx = { ...ctxBase, candidatosCriador: listaCandidatosCriador(estado) };
     const resultado = descobrirOpcaoDoVoto(votos[indice], ctx);
+
+    // Retirada descoberta na chegada: grava no registro pra não precisar decriptar de novo na
+    // apuração, e sai. Não é erro, então não sobe como aviso de "não decriptou".
+    if (resultado.retirado) {
+      votos[indice] = { ...votos[indice], retirado: true };
+      estadoDebate.set({ votosAcumulados: votos });
+      console.log(`DIAGNÓSTICO ENQUETE: voto ${idVoto} é RETIRADA (seleção vazia) — a pessoa desmarcou e não conta como votante.`);
+      return;
+    }
 
     if (resultado.opcao) {
       votos[indice] = { ...votos[indice], opcaoResolvida: resultado.opcao };
@@ -1682,7 +1711,10 @@ async function resolverEnquete() {
     // fica velho. Um voto que chegue nessa fresta sumiria da contagem — só acontece em enquete
     // com gente votando até o último segundo, ou seja, exatamente a enquete longa.
     const estado = estadoDebate.get();
-    const totalVotantes = new Set(estado.votantesConhecidos).size;
+    // Ponto de partida: todo mundo que emitiu algum evento de voto. É o melhor palpite possível
+    // quando não há chave de decriptação — nesse caso não dá pra saber quem desmarcou. Quando a
+    // apuração roda, este número é SUBSTITUÍDO pela contagem real, logo abaixo.
+    let totalVotantes = new Set(estado.votantesConhecidos).size;
     console.log(`DIAGNÓSTICO ENQUETE: votantesConhecidos=${totalVotantes}, votosAcumulados.length=${estado.votosAcumulados.length}, mensagemCriacao encontrada=${!!mensagemCriacao}`);
 
     // A chave vem do estado (base64, gravada na criação). mensagemCriacao só entra como resgate
@@ -1707,18 +1739,32 @@ async function resolverEnquete() {
         const contagem = new Map();
         const naoResolvidos = [];
         let decriptados = 0;
+        let retiradas = 0;
+        let votantesEfetivos = 0;
 
         for (const registro of ultimoVotoPorPessoa.values()) {
           const resultado = descobrirOpcaoDoVoto(registro, ctx);
+          // O último ato da pessoa foi desmarcar: ela não votou. Fica fora da contagem por opção
+          // E fora do total. Também não é "voto sem opção resolvida" — não há falha nenhuma aqui.
+          if (resultado.retirado) {
+            retiradas++;
+            continue;
+          }
+          votantesEfetivos++;
           if (resultado.decriptou) decriptados++;
           if (resultado.opcao) {
             contagem.set(resultado.opcao, (contagem.get(resultado.opcao) || 0) + 1);
           } else {
+            // Não decriptou: não sabemos se votou ou desmarcou. Conta como votante — errar pra
+            // menos aqui apagaria um voto real, e o portão do debate depende deste número.
             naoResolvidos.push(`${registro.votante} (${resultado.via})`);
           }
         }
 
-        console.log(`DIAGNÓSTICO ENQUETE: ${decriptados}/${ultimoVotoPorPessoa.size} voto(s) decriptado(s). Contagem por opção:`, JSON.stringify([...contagem]));
+        // A partir daqui o total é a contagem real, não mais "quem apareceu alguma vez".
+        totalVotantes = votantesEfetivos;
+
+        console.log(`DIAGNÓSTICO ENQUETE: ${decriptados}/${votantesEfetivos} voto(s) decriptado(s), ${retiradas} retirada(s) descartada(s). Contagem por opção:`, JSON.stringify([...contagem]));
         if (naoResolvidos.length > 0) {
           console.error(`🔴 DIAGNÓSTICO ENQUETE: ${naoResolvidos.length} voto(s) sem opção resolvida — ${naoResolvidos.join(' | ')}`);
           console.error(`🔴 Candidatos de criador tentados: [${ctx.candidatosCriador.join(', ')}] | criador confirmado: ${estado.pollCreatorConfirmado || 'nenhum'}`);
